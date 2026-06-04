@@ -24,6 +24,7 @@ local TweenService = game:GetService("TweenService")
 getgenv().Autofarm = false
 getgenv().KillAllOnFull = false
 getgenv().AvoidMurderer = false
+getgenv().VoidOnFull = false
 getgenv().SheriffAim = false
 getgenv().GunAccuracy = 25
 getgenv().KnifeAura = false
@@ -58,9 +59,12 @@ local rt = {
     SavedSkyPos = nil
 }
 
+-- Target Iteration Watchdog Time
+local LastFarmedTimestamp = tick()
+
 -- Octree Mapping Utilities
 function rt:Map()
-    for _, v in workspace:GetDescendants() do
+    for _, v in ipairs(workspace:GetDescendants()) do
         if v:IsA("Model") and v.Name == "Base" then
             return v.Parent
         end
@@ -76,17 +80,17 @@ end
 local function checkIfBagIsFull()
     local isFull = false
     pcall(function()
-        local coinBags = rt.player.PlayerGui:FindFirstChild("MainGUI", true).Game.CoinBags
-        local container = coinBags:FindFirstChild("Container")
+        local mainGui = rt.player.PlayerGui:FindFirstChild("MainGUI", true)
+        local coinBags = mainGui and mainGui.Game:FindFirstChild("CoinBags")
+        local container = coinBags and coinBags:FindFirstChild("Container")
+        
         if container then
-            for _, child in pairs(container:GetChildren()) do
+            for _, child in ipairs(container:GetChildren()) do
                 if child:IsA("Frame") then
-                    if child:GetAttribute("Full") == true then
-                        isFull = true
-                        break
-                    end
+                    local fullAttribute = child:GetAttribute("Full")
                     local fullIcon = child:FindFirstChild("FullBagIcon", true)
-                    if fullIcon and fullIcon.Visible then
+                    
+                    if fullAttribute == true or (fullIcon and fullIcon.Visible == true) then
                         isFull = true
                         break
                     end
@@ -137,7 +141,7 @@ end
 local function populateOctree()
     rt.octree:ClearAllNodes()
     if not rt.coinContainer then return end
-    for _, descendant in pairs(rt.coinContainer:GetDescendants()) do
+    for _, descendant in ipairs(rt.coinContainer:GetDescendants()) do
         if descendant:IsA("TouchTransmitter") then
             local parentCoin = descendant.Parent
             if parentCoin and not isCoinTouched(parentCoin) then
@@ -167,7 +171,7 @@ local function moveToPositionSlowly(targetPosition, duration, targetCoin)
         else
             break
         end
-        if alpha >= 1 then break end
+        if alpha >= 1 or (tick() - startTime) > (duration + 0.3) then break end
         task.wait() 
     end
 end
@@ -182,7 +186,7 @@ local function executeGlobalKillAll()
         if knife.Parent == Client.Backpack and Character:FindFirstChild("Humanoid") then
             Character.Humanoid:EquipTool(knife)
         end
-        for _, p in pairs(Players:GetPlayers()) do
+        for _, p in ipairs(Players:GetPlayers()) do
             if p ~= Client and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and not table.find(getgenv().Whitelisted, p.Name) then
                 local tarPart = p.Character.HumanoidRootPart
                 swingKnife()
@@ -194,7 +198,7 @@ local function executeGlobalKillAll()
 end
 
 local function GetMurderer()
-    for _, v in pairs(Players:GetPlayers()) do 
+    for _, v in ipairs(Players:GetPlayers()) do 
         if v.Character and (v.Backpack:FindFirstChild("Knife") or v.Character:FindFirstChild("Knife")) then
             return v.Name
         end
@@ -203,7 +207,7 @@ local function GetMurderer()
 end
 
 local function GetSheriff()
-    for _, v in pairs(Players:GetPlayers()) do 
+    for _, v in ipairs(Players:GetPlayers()) do 
         if v.Character and (v.Backpack:FindFirstChild("Gun") or v.Character:FindFirstChild("Gun")) then
             return v.Name
         end
@@ -245,7 +249,8 @@ end
 task.spawn(function()
     local currentContainer = nil
     while true do
-        task.wait()
+        task.wait(0.05)
+        
         if not getgenv().Autofarm then 
             if currentContainer then
                 rt.Disconnect(rt.Added)
@@ -261,7 +266,7 @@ task.spawn(function()
         local map = rt:Map()
         local container = map and map:FindFirstChild("CoinContainer")
 
-        if not container or not RootPart then
+        if not container or not RootPart or #container:GetChildren() == 0 then
             if currentContainer then
                 rt.Disconnect(rt.Added)
                 rt.Disconnect(rt.Removing)
@@ -269,31 +274,32 @@ task.spawn(function()
                 currentContainer = nil
                 rt.IsHidden = false
             end
-            task.wait(1)
+            task.wait(0.5)
             continue
         end
 
-        if container ~= currentContainer then
+        if container ~= currentContainer or (tick() - LastFarmedTimestamp > 4.5) then
             currentContainer = container
             rt.coinContainer = container
+            rt.touchedCoins = {} 
             populateOctree()
+            LastFarmedTimestamp = tick()
 
             rt.Disconnect(rt.Added)
             rt.Added = container.DescendantAdded:Connect(function(descendant)
-                if descendant:IsA("MeshPart") and descendant.Material == rt.Material then
+                if descendant:IsA("TouchTransmitter") then
                     local parentCoin = descendant.Parent
                     if parentCoin and not isCoinTouched(parentCoin) then
                         rt.octree:CreateNode(parentCoin.Position, parentCoin)
                         setupTouchTracking(parentCoin)
-                        setupPositionTracking(parentCoin, parentCoin.Position.Y)
                     end
                 end
             end)
 
             rt.Disconnect(rt.Removing)
             rt.Removing = container.DescendantRemoving:Connect(function(descendant)
-                if descendant:IsA("TouchTransmitter") and descendant.Parent.Name == "Coin_Server" then
-                    local parentCoin = descendant.Parent
+                if descendant:IsA("TouchTransmitter") or descendant:IsA("BasePart") then
+                    local parentCoin = descendant:IsA("TouchTransmitter") and descendant.Parent or descendant
                     if parentCoin then markCoinAsTouched(parentCoin) end
                 end
             end)
@@ -307,15 +313,25 @@ task.spawn(function()
                 task.wait(0.5)
             end
             
-            if not rt.IsHidden then
-                rt.SavedSkyPos = RootPart.Position + Vector3.new(0, 70, 0)
-                local duration = (RootPart.Position - rt.SavedSkyPos).Magnitude / rt.walkspeed
-                
-                moveToPositionSlowly(rt.SavedSkyPos, duration, nil)
-                if RootPart then RootPart.Anchored = true end
-                rt.IsHidden = true
+            -- NEW SYSTEM: Void on Full vs Sky Teleportation Check
+            if getgenv().VoidOnFull then
+                if Character and RootPart then
+                    RootPart.Anchored = false
+                    -- Drive the player instantly through map clips downward into the void limit
+                    local voidTarget = RootPart.Position - Vector3.new(0, 350, 0)
+                    moveToPositionSlowly(voidTarget, 1.5, nil)
+                end
+            else
+                if not rt.IsHidden then
+                    rt.SavedSkyPos = RootPart.Position + Vector3.new(0, 70, 0)
+                    local duration = (RootPart.Position - rt.SavedSkyPos).Magnitude / rt.walkspeed
+                    
+                    moveToPositionSlowly(rt.SavedSkyPos, duration, nil)
+                    if RootPart then RootPart.Anchored = true end
+                    rt.IsHidden = true
+                end
             end
-            task.wait(1) 
+            task.wait(0.5) 
             continue
         else
             if rt.IsHidden then
@@ -324,20 +340,19 @@ task.spawn(function()
             end
         end
 
-        -- Find closest coin with optional Murderer avoidance mechanics
-        local nodes = rt.octree:GetNearest(RootPart.Position, rt.radius, 10)
+        -- Find closest coin via spatial querying
+        local nodes = rt.octree:GetNearest(RootPart.Position, rt.radius, 15)
         local targetCoin = nil
 
-        for _, node in pairs(nodes) do
+        for _, node in ipairs(nodes) do
             local coin = node.Object
-            if coin and coin:IsA("BasePart") and not isCoinTouched(coin) then
+            if coin and coin:IsA("BasePart") and coin:IsDescendantOf(workspace) and not isCoinTouched(coin) then
                 if getgenv().AvoidMurderer then
                     local mName = GetMurderer()
                     local mPlayer = mName and Players:FindFirstChild(mName)
                     local mChar = mPlayer and mPlayer.Character
                     local mRoot = mChar and mChar:FindFirstChild("HumanoidRootPart")
                     
-                    -- If Murderer is too close to this coin (50 studs), skip it
                     if mRoot and (coin.Position - mRoot.Position).Magnitude < 50 then
                         continue
                     end
@@ -352,11 +367,16 @@ task.spawn(function()
             local closestCoinPosition = targetCoin.Position + Vector3.new(0, 3, 0)
             local duration = (RootPart.Position - closestCoinPosition).Magnitude / rt.walkspeed
 
+            LastFarmedTimestamp = tick() 
             moveToPositionSlowly(closestCoinPosition, duration, targetCoin)
-            task.wait(0.04) 
+            task.wait(0.02) 
             markCoinAsTouched(targetCoin)
         else
             if RootPart then RootPart.Anchored = false end
+            local items = container:GetChildren()
+            if #items > 0 then
+                populateOctree() 
+            end
             task.wait(0.2) 
         end
     end
@@ -407,7 +427,7 @@ local function ApplyESP(player)
     end)
 end
 
-for _, p in pairs(Players:GetPlayers()) do ApplyESP(p) end
+for _, p in ipairs(Players:GetPlayers()) do ApplyESP(p) end
 Players.PlayerAdded:Connect(ApplyESP)
 
 -- PANEL INTERFACE MANAGER
@@ -416,7 +436,7 @@ ScreenGui.Name = "SimpleMenu"
 ScreenGui.ResetOnSpawn = false
 
 local Panel = Instance.new("Frame")
-Panel.Size = UDim2.new(0, 240, 0, 260) -- Height extended for description box
+Panel.Size = UDim2.new(0, 240, 0, 260)
 Panel.Position = UDim2.new(0.05, 0, 0.25, 0)
 Panel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 Panel.BorderSizePixel = 0
@@ -461,7 +481,7 @@ TabListLayout.FillDirection = Enum.FillDirection.Horizontal
 TabListLayout.SortOrder = Enum.SortOrder.LayoutOrder
 TabListLayout.Parent = TabBar
 
--- Dynamic Description Bar (At the bottom of the UI frame)
+-- Dynamic Description Bar
 local DescBox = Instance.new("Frame")
 DescBox.Size = UDim2.new(1, -16, 0, 45)
 DescBox.Position = UDim2.new(0, 8, 1, -53)
@@ -502,7 +522,7 @@ local function CreateTab(name, order)
     TabButton.Parent = TabBar
 
     local TabScroll = Instance.new("ScrollingFrame")
-    TabScroll.Size = UDim2.new(1, 0, 1, -125) -- Adjusted scroll box boundaries for descriptions
+    TabScroll.Size = UDim2.new(1, 0, 1, -125)
     TabScroll.Position = UDim2.new(0, 0, 0, 65)
     TabScroll.BackgroundTransparency = 1
     TabScroll.BorderSizePixel = 0
@@ -582,11 +602,10 @@ local function AddToggle(parent, text, description, default, callback)
     DotCorner.CornerRadius = UDim.new(1, 0)
     DotCorner.Parent = Dot
 
-    -- Tooltip Event Management
     Btn.MouseEnter:Connect(function()
         DescText.Text = description
     end)
-    Btn.MouseLeave: Connect(function()
+    Btn.MouseLeave:Connect(function()
         DescText.Text = "Hover over any option to view its description here."
     end)
     
@@ -639,7 +658,7 @@ local function AddButton(parent, text, description, color, callback)
     parent.CanvasSize = UDim2.fromOffset(0, parent.UIListLayout.AbsoluteContentSize.Y + 15)
 end
 
--- CLEAN CHEAT LABELS (With added description args)
+-- UI Controls Configuration (Coins Tab)
 AddToggle(farmScroll, "Auto Collect Coins", "Automatically tweens your character to collect local map coins at a locked 25 walkspeed.", false, function(state)
     getgenv().Autofarm = state
 end)
@@ -652,6 +671,11 @@ AddToggle(farmScroll, "Kill All When Full", "Instantly teleports and executes al
     getgenv().KillAllOnFull = state
 end)
 
+AddToggle(farmScroll, "Void on Full", "When your bag becomes full, seamlessly tweens your player straight down through structural maps directly into the void.", false, function(state)
+    getgenv().VoidOnFull = state
+end)
+
+-- UI Controls Configuration (Combat Tab)
 AddToggle(combatScroll, "Sheriff Silent Aim", "Modifies your projectile data outputs to smoothly direct sheriff gunshots directly at the murderer.", false, function(state) 
     getgenv().SheriffAim = state 
 end)
@@ -663,7 +687,7 @@ AddToggle(combatScroll, "Murderer Kill Aura", "Constantly triggers hit detection
             task.wait(0.1)
             local knife = Client.Backpack:FindFirstChild("Knife") or (Client.Character and Client.Character:FindFirstChild("Knife"))
             if knife and knife:IsA("Tool") and RootPart then
-                for _, p in pairs(Players:GetPlayers()) do
+                for _, p in ipairs(Players:GetPlayers()) do
                     if p ~= Client and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and not table.find(getgenv().Whitelisted, p.Name) then
                         local tarPart = p.Character.HumanoidRootPart
                         if (tarPart.Position - RootPart.Position).Magnitude <= getgenv().KnifeRange then
@@ -681,6 +705,7 @@ end)
 AddButton(combatScroll, "Kill Everyone", "Force-equips your knife and attempts to instantly kill every user in the current server room.", Color3.fromRGB(150, 50, 50), executeGlobalKillAll)
 AddButton(combatScroll, "Shoot Murderer", "Force-equips your gun, teleports above the Murderer, fires a shot, and snaps back down instantly.", Color3.fromRGB(50, 100, 150), executeSheriffSnipe)
 
+-- UI Controls Configuration (Visuals Tab)
 AddToggle(visualScroll, "Player ESP", "Highlights all players across walls and assigns custom color identifiers based on game roles.", false, function(state) 
     getgenv().RoleESP = state 
 end)
@@ -740,4 +765,3 @@ task.spawn(function()
         end)
     end
 end)
--- you guys can have this one
