@@ -891,7 +891,7 @@ end)
 -- The hardcoded "VenusMc253" is swapped for whoever is physically closest to
 -- you. Each target is only re-arrested every few seconds to avoid invoke spam.
 local ArrestRange = 60   -- only auto-arrest targets within this many studs
-local ArrestDelay = 0.4  -- seconds between arrest attempts
+local ArrestDelay = 0.1  -- seconds between arrest attempts
 local arrestDebounce = {}
 
 local function getNearestPlayer()
