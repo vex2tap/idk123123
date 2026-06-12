@@ -1,0 +1,940 @@
+local FOV_Size = 230
+local HIT_PART = "Head"
+local SilentAimEnabled = true
+local SilentAimGunEnabled = true
+local GunFireDelay = 0.1 -- minimum seconds between our silent-aim shots (anti-spam)
+local ShowFOVCircle = true
+local RainbowFOV = false
+local HitChanceValue = 100
+local ESPEnabled = true
+local SelectedHitSound = "Rust"
+local TargetSpecificPlayer = "Everyone"
+local AutoPickUpEnabled = false
+local PickUpRadius = 15
+local AutoBreakoutEnabled = false
+local BreakoutRunning = false
+local AutoArrestEnabled = false
+
+local players = game:GetService("Players")
+local run_service = game:GetService("RunService")
+local user_input_service = game:GetService("UserInputService")
+local core_gui = game:GetService("CoreGui")
+local tween_service = game:GetService("TweenService")
+local sound_service = game:GetService("SoundService")
+local replicated_storage = game:GetService("ReplicatedStorage")
+local pathfinding_service = game:GetService("PathfindingService")
+local WorkspaceService = game:GetService("Workspace")
+
+local local_player = players.LocalPlayer
+local camera = workspace.CurrentCamera
+local giver_remote = replicated_storage:WaitForChild("Remotes"):WaitForChild("GiverPressed")
+
+-- (Auto-pickup resolves Workspace via game:GetService("Workspace") below.)
+
+-- Audio Asset IDs
+local SoundIDs = {
+    Rust = "rbxassetid://138750331387064",
+    Minecraft = "rbxassetid://139459336979009"
+}
+
+------------------------------------------------------------------------
+-- VISUAL FIELD OF VIEW RING
+------------------------------------------------------------------------
+local fov_circle = Drawing.new("Circle")
+fov_circle.Position = user_input_service:GetMouseLocation()
+fov_circle.Visible = ShowFOVCircle
+fov_circle.Color = Color3.fromRGB(255, 255, 255)
+fov_circle.Radius = FOV_Size
+fov_circle.Transparency = 1
+fov_circle.Filled = false
+pcall(function() fov_circle.NumSides = 64 end) -- some executors (Xeno) lack NumSides
+
+local hue = 0
+run_service.PreRender:Connect(function()
+    fov_circle.Position = user_input_service:GetMouseLocation()
+    if RainbowFOV then
+        hue = (hue + 0.005) % 1
+        fov_circle.Color = Color3.fromHSV(hue, 1, 1)
+    else
+        fov_circle.Color = Color3.fromRGB(255, 255, 255)
+    end
+end)
+
+------------------------------------------------------------------------
+-- HIGH-PERFORMANCE ESP SYSTEM
+------------------------------------------------------------------------
+local esp_cache = {}
+
+local function create_esp(player)
+    if esp_cache[player] then return end
+
+    local box = Drawing.new("Square")
+    box.Visible = false
+    box.Color = Color3.fromRGB(255, 0, 75)
+    box.Thickness = 1.5
+    box.Filled = false
+
+    local label = Drawing.new("Text")
+    label.Visible = false
+    label.Color = Color3.fromRGB(255, 255, 255)
+    label.Size = 13
+    label.Center = true
+    label.Outline = true
+
+    esp_cache[player] = {Box = box, Label = label}
+end
+
+local function remove_esp(player)
+    if esp_cache[player] then
+        esp_cache[player].Box:Remove()
+        esp_cache[player].Label:Remove()
+        esp_cache[player] = nil
+    end
+end
+
+players.PlayerAdded:Connect(create_esp)
+players.PlayerRemoving:Connect(remove_esp)
+for _, p in ipairs(players:GetPlayers()) do
+    if p ~= local_player then create_esp(p) end
+end
+
+run_service.RenderStepped:Connect(function()
+    for player, drawings in pairs(esp_cache) do
+        local character = player.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+        if ESPEnabled and hrp and humanoid and humanoid.Health > 0 and player.Team ~= local_player.Team then
+            local hrp_pos, on_screen = camera:WorldToViewportPoint(hrp.Position)
+
+            if on_screen then
+                local distance = (camera.CFrame.Position - hrp.Position).Magnitude
+                local box_width = 1000 / distance
+                local box_height = 1400 / distance
+
+                drawings.Box.Size = Vector2.new(box_width, box_height)
+                drawings.Box.Position = Vector2.new(hrp_pos.X - box_width / 2, hrp_pos.Y - box_height / 2)
+                drawings.Box.Visible = true
+
+                drawings.Label.Text = string.format("%s [%d m]", player.Name, math.floor(distance))
+                drawings.Label.Position = Vector2.new(hrp_pos.X, (hrp_pos.Y - box_height / 2) - 18)
+                drawings.Label.Visible = true
+                continue
+            end
+        end
+        drawings.Box.Visible = false
+        drawings.Label.Visible = false
+    end
+end)
+
+------------------------------------------------------------------------
+-- PLAY HIT SOUND FUNCTION
+------------------------------------------------------------------------
+local function playHitSound()
+    local soundId = SoundIDs[SelectedHitSound]
+    if soundId then
+        local sound = Instance.new("Sound")
+        sound.SoundId = soundId
+        sound.Volume = 1
+        sound.Parent = sound_service
+        sound:Play()
+        sound.Ended:Connect(function()
+            sound:Destroy()
+        end)
+    end
+end
+
+------------------------------------------------------------------------
+-- GUI ARCHITECTURE & CONFIGURATION WINDOW
+------------------------------------------------------------------------
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "EliteCombatPanel"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = core_gui
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 320, 0, 430)
+MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.Parent = MainFrame
+
+local UIStroke = Instance.new("UIStroke")
+UIStroke.Color = Color3.fromRGB(40, 40, 48)
+UIStroke.Thickness = 1.5
+UIStroke.Parent = MainFrame
+
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, 38)
+TopBar.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+
+local TopCorner = Instance.new("UICorner")
+TopCorner.CornerRadius = UDim.new(0, 10)
+TopCorner.Parent = TopBar
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -20, 1, 0)
+TitleLabel.Position = UDim2.new(0, 15, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Targeting Matrix Controller"
+TitleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
+TitleLabel.TextSize = 14
+TitleLabel.Font = Enum.Font.SourceSansBold
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TopBar
+
+------------------------------------------------------------------------
+-- TAB SYSTEM (tab bar + per-tab scrolling content panes)
+------------------------------------------------------------------------
+local TabBar = Instance.new("Frame")
+TabBar.Name = "TabBar"
+TabBar.Size = UDim2.new(1, -12, 0, 30)
+TabBar.Position = UDim2.new(0, 6, 0, 44)
+TabBar.BackgroundTransparency = 1
+TabBar.Parent = MainFrame
+
+local TabListLayout = Instance.new("UIListLayout")
+TabListLayout.FillDirection = Enum.FillDirection.Horizontal
+TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+TabListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TabListLayout.Padding = UDim.new(0, 4)
+TabListLayout.Parent = TabBar
+
+local ContentHolder = Instance.new("Frame")
+ContentHolder.Name = "ContentHolder"
+ContentHolder.Size = UDim2.new(1, -12, 1, -84)
+ContentHolder.Position = UDim2.new(0, 6, 0, 78)
+ContentHolder.BackgroundTransparency = 1
+ContentHolder.Parent = MainFrame
+
+local Tabs = {}
+local activeTab = nil
+
+local function selectTab(name)
+    for tabName, tab in pairs(Tabs) do
+        local on = (tabName == name)
+        tab.Content.Visible = on
+        tab.Button.BackgroundColor3 = on and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(26, 26, 32)
+        tab.Button.TextColor3 = on and Color3.fromRGB(18, 18, 22) or Color3.fromRGB(200, 200, 205)
+    end
+    activeTab = name
+end
+
+local tabOrder = 0
+local function CreateTab(name)
+    tabOrder = tabOrder + 1
+
+    local Button = Instance.new("TextButton")
+    Button.Name = name .. "Tab"
+    Button.Size = UDim2.new(0, 71, 1, 0)
+    Button.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+    Button.TextColor3 = Color3.fromRGB(200, 200, 205)
+    Button.Text = name
+    Button.Font = Enum.Font.SourceSansBold
+    Button.TextSize = 12
+    Button.AutoButtonColor = false
+    Button.LayoutOrder = tabOrder
+    Button.Parent = TabBar
+
+    local bCorner = Instance.new("UICorner")
+    bCorner.CornerRadius = UDim.new(0, 6)
+    bCorner.Parent = Button
+
+    local Content = Instance.new("ScrollingFrame")
+    Content.Name = name .. "Content"
+    Content.Size = UDim2.new(1, 0, 1, 0)
+    Content.BackgroundTransparency = 1
+    Content.BorderSizePixel = 0
+    Content.ScrollBarThickness = 4
+    Content.ScrollBarImageColor3 = Color3.fromRGB(45, 45, 52)
+    Content.CanvasSize = UDim2.new(0, 0, 0, 0)
+    Content.Visible = false
+    Content.Parent = ContentHolder
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = Content
+
+    layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        Content.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 8)
+    end)
+
+    Button.MouseButton1Click:Connect(function()
+        selectTab(name)
+    end)
+
+    Tabs[name] = {Button = Button, Content = Content}
+    return Content
+end
+
+------------------------------------------------------------------------
+-- POLISHED CUSTOM UI COMPONENTS
+------------------------------------------------------------------------
+local function AddSmoothToggle(parent, labelText, initialValue, structuralCallback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -8, 0, 36)
+    Row.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+    Row.BorderSizePixel = 0
+    Row.Parent = parent
+    
+    local BCorner = Instance.new("UICorner")
+    BCorner.CornerRadius = UDim.new(0, 6)
+    BCorner.Parent = Row
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.65, 0, 1, 0)
+    Label.Position = UDim2.new(0, 12, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = labelText
+    Label.TextColor3 = Color3.fromRGB(215, 215, 220)
+    Label.TextSize = 13
+    Label.Font = Enum.Font.SourceSansSemibold
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+    
+    local ToggleTrack = Instance.new("TextButton")
+    ToggleTrack.Size = UDim2.new(0, 44, 0, 20)
+    ToggleTrack.Position = UDim2.new(1, -52, 0.5, -10)
+    ToggleTrack.BackgroundColor3 = initialValue and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(45, 45, 52)
+    ToggleTrack.Text = ""
+    ToggleTrack.Parent = Row
+    
+    local TrackCorner = Instance.new("UICorner")
+    TrackCorner.CornerRadius = UDim.new(1, 0)
+    TrackCorner.Parent = ToggleTrack
+    
+    local WhiteDot = Instance.new("Frame")
+    WhiteDot.Size = UDim2.new(0, 14, 0, 14)
+    WhiteDot.Position = initialValue and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+    WhiteDot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    WhiteDot.BorderSizePixel = 0
+    WhiteDot.Parent = ToggleTrack
+    
+    local DotCorner = Instance.new("UICorner")
+    DotCorner.CornerRadius = UDim.new(1, 0)
+    DotCorner.Parent = WhiteDot
+    
+    local isToggled = initialValue
+    ToggleTrack.MouseButton1Click:Connect(function()
+        isToggled = not isToggled
+        structuralCallback(isToggled)
+        
+        local endPosition = isToggled and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        local endColor = isToggled and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(45, 45, 52)
+        
+        tween_service:Create(WhiteDot, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = endPosition}):Play()
+        tween_service:Create(ToggleTrack, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundColor3 = endColor}):Play()
+    end)
+end
+
+local function AddSliderElement(parent, labelText, min, max, initialValue, structuralCallback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -8, 0, 48)
+    Row.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+    Row.BorderSizePixel = 0
+    Row.Parent = parent
+    
+    local BCorner = Instance.new("UICorner")
+    BCorner.CornerRadius = UDim.new(0, 6)
+    BCorner.Parent = Row
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.65, 0, 0, 22)
+    Label.Position = UDim2.new(0, 12, 0, 2)
+    Label.BackgroundTransparency = 1
+    Label.Text = labelText
+    Label.TextColor3 = Color3.fromRGB(215, 215, 220)
+    Label.TextSize = 13
+    Label.Font = Enum.Font.SourceSansSemibold
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+    
+    local ValueLabel = Instance.new("TextLabel")
+    ValueLabel.Size = UDim2.new(0.3, 0, 0, 22)
+    ValueLabel.Position = UDim2.new(1, -104, 0, 2)
+    ValueLabel.BackgroundTransparency = 1
+    ValueLabel.Text = tostring(initialValue) .. ((labelText:find("Chance") or labelText:find("Percentage")) and "%" or "")
+    ValueLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+    ValueLabel.TextSize = 13
+    ValueLabel.Font = Enum.Font.SourceSansBold
+    ValueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    ValueLabel.Parent = Row
+
+    local SliderTrack = Instance.new("TextButton")
+    SliderTrack.Size = UDim2.new(1, -24, 0, 5)
+    SliderTrack.Position = UDim2.new(0, 12, 1, -12)
+    SliderTrack.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+    SliderTrack.Text = ""
+    SliderTrack.Parent = Row
+    
+    local TrackCorner = Instance.new("UICorner")
+    TrackCorner.CornerRadius = UDim.new(1, 0)
+    TrackCorner.Parent = SliderTrack
+    
+    local SliderFill = Instance.new("Frame")
+    SliderFill.Size = UDim2.new((initialValue - min) / (max - min), 0, 1, 0)
+    SliderFill.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+    SliderFill.BorderSizePixel = 0
+    SliderFill.Parent = SliderTrack
+    
+    local isDragging = false
+    local function updateSliderMovement()
+        local mousePos = user_input_service:GetMouseLocation().X
+        local trackPos = SliderTrack.AbsolutePosition.X
+        local trackWidth = SliderTrack.AbsoluteSize.X
+        local percentage = math.clamp((mousePos - trackPos) / trackWidth, 0, 1)
+        
+        SliderFill.Size = UDim2.new(percentage, 0, 1, 0)
+        local totalValue = math.round(min + (percentage * (max - min)))
+        ValueLabel.Text = tostring(totalValue) .. ((labelText:find("Chance") or labelText:find("Percentage")) and "%" or "")
+        structuralCallback(totalValue)
+    end
+    
+    SliderTrack.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            isDragging = true
+            updateSliderMovement()
+        end
+    end)
+    user_input_service.InputChanged:Connect(function(input)
+        if isDragging and input.UserInputType == Enum.UserInputType.MouseMovement then updateSliderMovement() end
+    end)
+    user_input_service.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then isDragging = false end
+    end)
+end
+
+local function AddDropdownSelector(parent, labelText, optionsArray, currentDefault, uniqueZ, dynamicProvider, structuralCallback)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, -8, 0, 36)
+    Row.BackgroundColor3 = Color3.fromRGB(26, 26, 32)
+    Row.BorderSizePixel = 0
+    Row.ZIndex = uniqueZ
+    Row.Parent = parent
+    
+    local BCorner = Instance.new("UICorner")
+    BCorner.CornerRadius = UDim.new(0, 6)
+    BCorner.Parent = Row
+    
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(0.5, 0, 1, 0)
+    Label.Position = UDim2.new(0, 12, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = labelText
+    Label.TextColor3 = Color3.fromRGB(215, 215, 220)
+    Label.TextSize = 13
+    Label.Font = Enum.Font.SourceSansSemibold
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.Parent = Row
+    
+    local TriggerBtn = Instance.new("TextButton")
+    TriggerBtn.Size = UDim2.new(0, 130, 0, 22)
+    TriggerBtn.Position = UDim2.new(1, -142, 0.5, -11)
+    TriggerBtn.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    TriggerBtn.TextColor3 = Color3.fromRGB(46, 204, 113)
+    TriggerBtn.Text = currentDefault
+    TriggerBtn.Font = Enum.Font.SourceSansBold
+    TriggerBtn.TextSize = 12
+    TriggerBtn.ZIndex = uniqueZ + 1
+    TriggerBtn.Parent = Row
+    
+    local DropMenu = Instance.new("ScrollingFrame")
+    DropMenu.Size = UDim2.new(1, 0, 0, 100)
+    DropMenu.Position = UDim2.new(0, 0, 1, 2)
+    DropMenu.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    DropMenu.BorderSizePixel = 0
+    DropMenu.Visible = false
+    DropMenu.ZIndex = uniqueZ + 2
+    DropMenu.ScrollBarThickness = 3
+    DropMenu.ScrollBarImageColor3 = Color3.fromRGB(45, 45, 52)
+    DropMenu.Parent = TriggerBtn
+    
+    local MenuListLayout = Instance.new("UIListLayout")
+    MenuListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    MenuListLayout.Parent = DropMenu
+
+    local DropStroke = Instance.new("UIStroke")
+    DropStroke.Color = Color3.fromRGB(40, 40, 48)
+    DropStroke.Parent = DropMenu
+    
+    local function populateOptions(list)
+        for _, child in ipairs(DropMenu:GetChildren()) do
+            if child:IsA("TextButton") then child:Destroy() end
+        end
+        
+        DropMenu.CanvasSize = UDim2.new(0, 0, 0, #list * 24)
+        DropMenu.Size = UDim2.new(1, 0, 0, math.min(#list * 24, 120))
+        
+        for index, optionName in ipairs(list) do
+            local OptBtn = Instance.new("TextButton")
+            OptBtn.Size = UDim2.new(1, 0, 0, 24)
+            OptBtn.BackgroundTransparency = 1
+            OptBtn.TextColor3 = Color3.fromRGB(200, 200, 205)
+            OptBtn.Text = optionName
+            OptBtn.Font = Enum.Font.SourceSans
+            OptBtn.TextSize = 12
+            OptBtn.ZIndex = uniqueZ + 3
+            OptBtn.Parent = DropMenu
+            
+            OptBtn.MouseButton1Click:Connect(function()
+                TriggerBtn.Text = optionName
+                DropMenu.Visible = false
+                structuralCallback(optionName)
+            end)
+        end
+    end
+    
+    TriggerBtn.MouseButton1Click:Connect(function()
+        if dynamicProvider then
+            populateOptions(dynamicProvider())
+        else
+            populateOptions(optionsArray)
+        end
+        DropMenu.Visible = not DropMenu.Visible
+    end)
+end
+
+------------------------------------------------------------------------
+-- AUTO JAIL BREAKOUT (PATHFINDING)
+------------------------------------------------------------------------
+local melee_remote = replicated_storage:WaitForChild("meleeEvent")
+
+-- World position of the cell toilet (from the provided CFrame).
+local TOILET_POSITION = Vector3.new(873.30127, 98.0302429, 2443.44434)
+
+local function getChar()
+    local character = local_player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    return character, humanoid, hrp
+end
+
+-- Pathfind + walk to a world position. Recomputes when blocked/stuck (doors, corners).
+local function walkTo(targetPos, stillOn, maxAttempts)
+    maxAttempts = maxAttempts or 8
+    for _ = 1, maxAttempts do
+        if stillOn and not stillOn() then return false end
+        local _, humanoid, hrp = getChar()
+        if not humanoid or not hrp then return false end
+        if (hrp.Position - targetPos).Magnitude < 6 then return true end
+
+        local path = pathfinding_service:CreatePath({
+            AgentRadius = 2.5,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentCanClimb = false,
+            WaypointSpacing = 4,
+        })
+
+        local ok = pcall(function()
+            path:ComputeAsync(hrp.Position, targetPos)
+        end)
+
+        if not ok or path.Status ~= Enum.PathStatus.Success then
+            -- No path found: fall back to a direct move, then retry.
+            humanoid:MoveTo(targetPos)
+            humanoid.MoveToFinished:Wait()
+        else
+            local blocked = false
+            local waypoints = path:GetWaypoints()
+            for i = 2, #waypoints do
+                if stillOn and not stillOn() then return false end
+                local wp = waypoints[i]
+                if wp.Action == Enum.PathWaypointAction.Jump then
+                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                end
+                humanoid:MoveTo(wp.Position)
+
+                local reached, t0 = false, os.clock()
+                while os.clock() - t0 < 4 do
+                    if stillOn and not stillOn() then return false end
+                    local _, _, curHrp = getChar()
+                    if not curHrp then return false end
+                    if (curHrp.Position - wp.Position).Magnitude < 4.5 then
+                        reached = true
+                        break
+                    end
+                    task.wait(0.08)
+                end
+
+                if not reached then
+                    blocked = true -- stuck on this waypoint; recompute from here
+                    break
+                end
+            end
+            if not blocked then return true end
+        end
+    end
+    return false
+end
+
+-- Equip the Hammer tool once it lands in the backpack/character.
+local function equipHammer()
+    local tool, t = nil, 0
+    repeat
+        local backpack = local_player:FindFirstChildOfClass("Backpack")
+        local character = local_player.Character
+        tool = (backpack and backpack:FindFirstChild("Hammer"))
+            or (character and character:FindFirstChild("Hammer"))
+        if tool then break end
+        task.wait(0.2)
+        t = t + 0.2
+    until t >= 6
+
+    local character, humanoid = getChar()
+    if tool and humanoid then
+        if tool.Parent ~= character then
+            pcall(function() humanoid:EquipTool(tool) end)
+            if tool.Parent ~= character then tool.Parent = character end
+        end
+        return true
+    end
+    return false
+end
+
+local function findToilet()
+    local pc = WorkspaceService:FindFirstChild("Prison_Cellblock")
+    local cb = pc and pc:FindFirstChild("Cells_B")
+    local c1 = cb and cb:FindFirstChild("cell1")
+    local toilet = c1 and c1:FindFirstChild("Toilet")
+    return toilet or WorkspaceService:FindFirstChild("Toilet", true)
+end
+
+local function runBreakoutSequence()
+    if BreakoutRunning then return end
+    BreakoutRunning = true
+
+    local stillOn = function() return AutoBreakoutEnabled end
+
+    -- 1) Grab the hammer. Walk to a physical Hammer giver if one exists, then fire the giver remote.
+    local hammerGiver = WorkspaceService:FindFirstChild("Hammer", true)
+    if hammerGiver then
+        local pos = (hammerGiver:IsA("Model") and hammerGiver:GetPivot().Position)
+            or (hammerGiver:IsA("BasePart") and hammerGiver.Position)
+        if pos then walkTo(pos, stillOn) end
+    end
+    pcall(function()
+        local args = { replicated_storage:WaitForChild("Hammer") }
+        giver_remote:FireServer(unpack(args))
+    end)
+    task.wait(0.5)
+    if not AutoBreakoutEnabled then BreakoutRunning = false return end
+
+    -- 2) Pathfind to the toilet.
+    walkTo(TOILET_POSITION, stillOn)
+    if not AutoBreakoutEnabled then BreakoutRunning = false return end
+
+    -- 3) Pull out the hammer.
+    equipHammer()
+    task.wait(0.3)
+
+    -- 4) Smash the toilet while we are right next to it and the toggle is on.
+    while AutoBreakoutEnabled do
+        local toilet = findToilet()
+        if not toilet then break end -- toilet gone => wall is open, we're out
+
+        local _, _, hrp = getChar()
+        if not hrp then break end
+
+        local toiletPos = (toilet:IsA("Model") and toilet:GetPivot().Position)
+            or (toilet:IsA("BasePart") and toilet.Position) or TOILET_POSITION
+        if (hrp.Position - toiletPos).Magnitude > 10 then
+            walkTo(toiletPos, stillOn)
+        end
+
+        local args = { toilet, 1, 1 }
+        pcall(function() melee_remote:FireServer(unpack(args)) end)
+        task.wait(0.1)
+    end
+
+    BreakoutRunning = false
+end
+
+------------------------------------------------------------------------
+-- TABS + COMPONENT RENDER POPULATION
+------------------------------------------------------------------------
+local MainTabContent     = CreateTab("Main")
+local ESPTabContent      = CreateTab("ESP")
+local PoliceTabContent   = CreateTab("Police")
+local PrisonerTabContent = CreateTab("Prisoner")
+
+local function getActiveServerUsernames()
+    local names = {"Everyone"}
+    for _, p in ipairs(players:GetPlayers()) do
+        if p ~= local_player then table.insert(names, p.Name) end
+    end
+    return names
+end
+
+-- ===== MAIN TAB: silent aim + everything tied to it =====
+AddSmoothToggle(MainTabContent, "Silent Aim", SilentAimEnabled, function(s) SilentAimEnabled = s end)
+AddSmoothToggle(MainTabContent, "Silent Aim (Gun)", SilentAimGunEnabled, function(s) SilentAimGunEnabled = s end)
+AddSmoothToggle(MainTabContent, "Show FOV Circle", ShowFOVCircle, function(s) ShowFOVCircle = s fov_circle.Visible = s end)
+AddSmoothToggle(MainTabContent, "Rainbow FOV Mode", RainbowFOV, function(s) RainbowFOV = s end)
+
+AddSliderElement(MainTabContent, "FOV Radius Size", 50, 600, FOV_Size, function(val) FOV_Size = val fov_circle.Radius = val end)
+AddSliderElement(MainTabContent, "Hit Chance Percentage", 0, 100, HitChanceValue, function(val) HitChanceValue = val end)
+
+AddDropdownSelector(MainTabContent, "Target Bone Location", {"Head", "Torso", "HumanoidRootPart", "Left Arm", "Right Arm"}, HIT_PART, 50, nil, function(part)
+    HIT_PART = part
+end)
+AddDropdownSelector(MainTabContent, "Impact Hit Sound", {"Rust", "Minecraft"}, SelectedHitSound, 40, nil, function(soundName)
+    SelectedHitSound = soundName
+end)
+AddDropdownSelector(MainTabContent, "Target Specific Player", {}, "Everyone", 30, getActiveServerUsernames, function(selection)
+    TargetSpecificPlayer = selection
+end)
+
+-- ===== ESP TAB =====
+AddSmoothToggle(ESPTabContent, "Player ESP Boxes", ESPEnabled, function(s) ESPEnabled = s end)
+
+-- ===== POLICE TAB =====
+AddSmoothToggle(PoliceTabContent, "Auto Arrest", AutoArrestEnabled, function(s) AutoArrestEnabled = s end)
+
+-- ===== PRISONER TAB =====
+AddSmoothToggle(PrisonerTabContent, "Auto Breakout (Jail)", AutoBreakoutEnabled, function(s)
+    AutoBreakoutEnabled = s
+    if s then task.spawn(runBreakoutSequence) end
+end)
+AddSmoothToggle(PrisonerTabContent, "Auto Pick-Up Items", AutoPickUpEnabled, function(s) AutoPickUpEnabled = s end)
+AddSliderElement(PrisonerTabContent, "Pick-Up Radius", 5, 50, PickUpRadius, function(val) PickUpRadius = val end)
+
+-- open the Main tab by default
+selectTab("Main")
+
+------------------------------------------------------------------------
+-- AUTOMATED ITEM PICKUP PROCESS LOOP (LAG-FREE VERSION)
+------------------------------------------------------------------------
+-- Items grabbed by name straight out of Workspace (game:GetService("Workspace")).
+local PickupTargets = { "Key card", "M9" }
+
+local pickupDebounce = {}
+
+local function fireGiver(object)
+    if not object then return end
+    local args = { object }
+    giver_remote:FireServer(unpack(args))
+end
+
+local function triggerGiver(object)
+    if not AutoPickUpEnabled or not object then return end
+
+    local character = local_player.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    local target_pos = (object:IsA("Model") and object:GetPivot().Position)
+        or (object:IsA("BasePart") and object.Position)
+    if not target_pos then return end
+
+    if (hrp.Position - target_pos).Magnitude <= PickUpRadius then
+        if pickupDebounce[object] and (os.clock() - pickupDebounce[object]) < 1 then return end
+        pickupDebounce[object] = os.clock()
+        fireGiver(object) -- send the REAL item reference, not a blank Model
+    end
+end
+
+task.spawn(function()
+    while task.wait(0.3) do
+        if AutoPickUpEnabled then
+            -- Named pickups (Key card, M9, ...) pulled directly from Workspace.
+            for _, name in ipairs(PickupTargets) do
+                local item = WorkspaceService:FindFirstChild(name)
+                if item then triggerGiver(item) end
+            end
+
+            -- Generic giver pads / ClickDetector items anywhere in Workspace.
+            for _, object in ipairs(WorkspaceService:GetChildren()) do
+                if object.Name == "Giver" or object:FindFirstChildOfClass("ClickDetector") then
+                    triggerGiver(object)
+                end
+            end
+        end
+    end
+end)
+
+------------------------------------------------------------------------
+-- AIM CORRECTION HOOK FILTER
+------------------------------------------------------------------------
+local function get_closest_player(part_name, fov)
+    fov = fov or math.huge
+    local closest_player = nil
+    local closest_position = nil
+    local closest_distance = fov
+
+    for _, player in players:GetPlayers() do
+        if player == local_player or player.Team == local_player.Team then continue end
+        if TargetSpecificPlayer ~= "Everyone" and player.Name ~= TargetSpecificPlayer then continue end
+
+        local character = player.Character
+        local part = character and character:FindFirstChild(part_name)
+        if not part then continue end
+        
+        local screen_position = camera:WorldToViewportPoint(part.Position)
+        if screen_position.Z <= 0 then continue end
+        
+        local screen_center = user_input_service:GetMouseLocation()
+        local screen_distance = (Vector2.new(screen_position.X, screen_position.Y) - screen_center).Magnitude
+        
+        if screen_distance < closest_distance then
+            closest_player = player
+            closest_position = part.Position
+            closest_distance = screen_distance
+        end
+    end
+    return closest_player, closest_position
+end
+
+LPH_NO_UPVALUES = function(Function)
+    return function(...) return Function(...) end
+end
+
+-- Legacy castRay silent aim. Needs filtergc + hookfunction, which lightweight
+-- executors (e.g. Xeno) do not support, so it is wrapped to fail quietly and
+-- never block the independent systems below it.
+pcall(function()
+    local castRay = filtergc("function", {Name = "castRay"}, true)
+    local old; old = hookfunction(castRay, LPH_NO_UPVALUES(function(...)
+        if SilentAimEnabled then
+            if math.random(1, 100) <= HitChanceValue then
+                local closest_player, closest_position = get_closest_player(HIT_PART, FOV_Size)
+                if closest_player and closest_position and closest_player.Character:FindFirstChild(HIT_PART) then
+                    task.spawn(playHitSound)
+                    return closest_player.Character[HIT_PART], closest_position
+                end
+            end
+        end
+        return old(...)
+    end))
+end)
+
+------------------------------------------------------------------------
+-- GUN-REMOTE SILENT AIM (independent / hook-free)  --  Xeno-safe
+------------------------------------------------------------------------
+-- No hookmetamethod / hookfunction / getnamecallmethod / newcclosure / filtergc.
+-- Fires the gun's own ShootEvent ONE shot per click at the locked FOV target.
+-- Per-click pacing (plus a min-gap) avoids the remote-flood that desyncs ammo
+-- and trips anti-cheat into locking your tools.
+--
+--   ShootEvent:FireServer({ { origin, hitPos, hitPart } })
+local gun_shoot_event = nil
+local gun_last_shot = 0
+
+-- Where the bullet starts: equipped tool's handle, otherwise the camera.
+local function getOriginPosition()
+    local character = local_player.Character
+    local tool = character and character:FindFirstChildOfClass("Tool")
+    if tool then
+        local handle = tool:FindFirstChild("Handle") or tool:FindFirstChildWhichIsA("BasePart")
+        if handle then return handle.Position end
+    end
+    return camera.CFrame.Position
+end
+
+local function trySilentShot()
+    if not SilentAimGunEnabled then return end
+    if not gun_shoot_event then return end
+    if (os.clock() - gun_last_shot) < GunFireDelay then return end
+    if math.random(1, 100) > HitChanceValue then return end
+
+    local target_player = get_closest_player(HIT_PART, FOV_Size)
+    local target_part = target_player
+        and target_player.Character
+        and target_player.Character:FindFirstChild(HIT_PART)
+    if not target_part then return end
+
+    gun_last_shot = os.clock()
+    local args = {
+        {
+            {
+                getOriginPosition(), -- origin
+                target_part.Position, -- hit position -> locked body part
+                target_part           -- hit instance -> locked body part
+            }
+        }
+    }
+    pcall(function() gun_shoot_event:FireServer(unpack(args)) end)
+    task.spawn(playHitSound)
+end
+
+-- One redirected shot per real left-click (no spam loop).
+user_input_service.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        trySilentShot()
+    end
+end)
+
+-- Resolve the remote off-thread so script load never blocks.
+task.spawn(function()
+    local gun_remotes = replicated_storage:WaitForChild("GunRemotes", 10)
+    gun_shoot_event = (gun_remotes and gun_remotes:WaitForChild("ShootEvent", 10)) or nil
+end)
+
+------------------------------------------------------------------------
+-- AUTO ARREST (nearest player)  --  Xeno-safe
+------------------------------------------------------------------------
+-- ArrestPlayer is a RemoteFunction:
+--   Remotes.ArrestPlayer:InvokeServer(targetPlayer, 1)
+-- The hardcoded "VenusMc253" is swapped for whoever is physically closest to
+-- you. Each target is only re-arrested every few seconds to avoid invoke spam.
+local ArrestRange = 60   -- only auto-arrest targets within this many studs
+local ArrestDelay = 0.4  -- seconds between arrest attempts
+local arrestDebounce = {}
+
+local function getNearestPlayer()
+    local myChar = local_player.Character
+    local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHrp then return nil end
+
+    local myTeam = local_player.Team
+    local nearest, nearestDist = nil, ArrestRange
+
+    for _, p in ipairs(players:GetPlayers()) do
+        if p ~= local_player and (myTeam == nil or p.Team ~= myTeam) then
+            local char = p.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0 then
+                local d = (hrp.Position - myHrp.Position).Magnitude
+                if d <= nearestDist then
+                    nearest, nearestDist = p, d
+                end
+            end
+        end
+    end
+    return nearest
+end
+
+task.spawn(function()
+    local remotes = replicated_storage:WaitForChild("Remotes", 10)
+    local arrest_remote = remotes and remotes:WaitForChild("ArrestPlayer", 10)
+    if not arrest_remote then return end
+
+    while task.wait(ArrestDelay) do
+        if AutoArrestEnabled then
+            local target = getNearestPlayer()
+            if target then
+                local now = os.clock()
+                if (not arrestDebounce[target]) or ((now - arrestDebounce[target]) > 3) then
+                    arrestDebounce[target] = now
+                    pcall(function()
+                        arrest_remote:InvokeServer(target, 1)
+                    end)
+                end
+            end
+        end
+    end
+end)
