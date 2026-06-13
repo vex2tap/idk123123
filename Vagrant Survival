@@ -1,0 +1,472 @@
+if not game:IsLoaded() then game.Loaded:Wait(); end;
+
+local cloneref = cloneref or function(i: Instance) return i; end;
+local clonefunction = clonefunction or function(f: (...any) -> (...any)) return f; end;
+local newcclosure = newcclosure or clonefunction;
+
+local RS: ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"));
+local Players: Players = cloneref(game:GetService("Players"));
+local UIS: UserInputService = cloneref(game:GetService("UserInputService"));
+local RunService: RunService = cloneref(game:GetService("RunService"));
+local CoreGui: CoreGui = cloneref(game:GetService("CoreGui"));
+local TweenService: TweenService = cloneref(game:GetService("TweenService"));
+
+local plr = Players.LocalPlayer;
+local cam = workspace.CurrentCamera;
+
+repeat
+	task.wait();
+until plr.Character and plr.Character:FindFirstChild("Humanoid");
+
+local isMobile = UIS.TouchEnabled and not UIS.KeyboardEnabled and not UIS.MouseEnabled;
+
+-- Global Configuration States
+getgenv().SilentAimEnabled = true
+getgenv().ESPEnabled = true
+getgenv().FOVVisible = true
+getgenv().fov = getgenv().fov or 300
+
+-- Cache Core Remotes / Modules
+local s, proj = pcall(require, RS.Modules.Client.Behaviours.BehaviourGunClient.ProjectileEnvConstructors.Projectile);
+local s2, projh = pcall(require, RS.Modules.Client.Behaviours.BehaviourGunClient.ProjectileEnvConstructors.ProjectileHoming);
+local s3, hs = pcall(require, RS.Modules.Client.Behaviours.BehaviourGunClient.ProjectileEnvConstructors.Hitscan);
+
+if not (s and s2 and s3) then return; end;
+
+local Chars, Enemies, mif, ic = workspace:FindFirstChild("Spawned")
+    and workspace.Spawned:FindFirstChild("PlayerCharacters"), workspace:FindFirstChild("Spawned")
+    and workspace.Spawned:FindFirstChild("Enemies"), workspace:FindFirstChild("Spawned")
+    and workspace.Spawned:FindFirstChild("MouseIgnoreFolder"), RS:FindFirstChild("Modules")
+    and RS.Modules:FindFirstChild("Shared")
+    and RS.Modules.Shared:FindFirstChild("GameConfiguration")
+    and RS.Modules.Shared.GameConfiguration:FindFirstChild("ItemConfigs");
+
+if not (Chars and Enemies and mif and ic) then return; end;
+
+-- Remove Spread
+for _, v: ModuleScript in next, ic:GetChildren() do 
+    local old; 
+    old = clonefunction(hookfunction(require(v), function(...) 
+        return table.freeze(rawset(table.clone(old(...)), "ProjectileSpread", 0)); 
+    end)); 
+end;
+
+local rp = RaycastParams.new();
+rp.FilterType = Enum.RaycastFilterType.Exclude;
+rp.IgnoreWater = true;
+
+local isVisible = function(part: BasePart, origin: Vector3): (boolean, Instance?)
+    local char = plr.Character;
+    if not (char and part) then return false, nil; end;
+
+    rp.FilterDescendantsInstances = {char, mif};
+    local origin = origin or cam.CFrame.Position;
+    local dir = part.Position - origin;
+    
+    local result: RaycastResult = workspace:Raycast(origin, dir, rp);
+    if not result then return true, nil; end;
+
+    if result.Instance:IsDescendantOf(part.Parent) then
+        return true, result.Instance;
+    end;
+
+    return false, result.Instance;
+end;
+
+local getTarget = function(origin: Vector3)
+    local cPart, cDistance = nil, getgenv().fov;
+    local tmp = table.create(#Chars:GetChildren() + #Enemies:GetChildren());
+
+    local i = 0;
+    for _, v in next, Chars:GetChildren() do i += 1; tmp[i] = v; end;
+    for _, v in next, Enemies:GetChildren() do i += 1; tmp[i] = v; end;
+
+    for _, char: Model in next, tmp do
+        if char == plr.Character or (char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart:FindFirstChild("ForceField1", true)) or (char:FindFirstChild("Humanoid") and char.Humanoid.Health <= 0) then continue; end;
+
+        local tPart: BasePart = char:FindFirstChild("Head") or char.PrimaryPart or char:FindFirstChild("HumanoidRootPart");
+        if not tPart then continue; end;
+
+        local pos, onScreen = cam:WorldToViewportPoint(tPart.Position);
+        if not onScreen then continue; end;
+
+        local v, nTPart = isVisible(tPart, origin);
+        if not v then
+            v, nTPart = isVisible(char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"), origin);
+            if not v then continue; end;
+        end;
+
+        if nTPart then tPart = nTPart; end;
+
+        local distance = (Vector2.new(pos.X, pos.Y) - (isMobile and Vector2.new(cam.ViewportSize.X/2, cam.ViewportSize.Y/2) or UIS:GetMouseLocation())).Magnitude;
+        if distance < cDistance then
+            cPart = tPart;
+            cDistance = distance;
+        end;
+    end;
+
+    return cPart;
+end;
+
+-- Hook Bullet Paths
+local hook = function(m: () -> ())
+	local old; old = clonefunction(hookfunction(m, newcclosure(function(_, info, ...)
+		local r = old(_, info, ...);
+		local old2 = rawget(r, "Fire");
+		rawset(r, "Fire", newcclosure(function(_, endPos, ...)
+			if getgenv().SilentAimEnabled then
+				local c = getTarget(((rawget(info, "HumanoidRootPart") or plr.Character:FindFirstChild("HumanoidRootPart")).CFrame * CFrame.new(0, 1, 0)).Position);
+				if c then
+					return old2(_, c.Position, ...);
+				end;
+			end;
+			return old2(_, endPos, ...);
+		end));
+		return r;
+	end)));
+end;
+
+hook(proj);
+hook(projh);
+hook(hs);
+
+-- ESP System
+local activeESP = {}
+local function createESP(model, isEnemy)
+    if activeESP[model] or not getgenv().ESPEnabled then return end
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "CleanESP"
+    highlight.FillColor = isEnemy and Color3.fromRGB(255, 60, 60) or Color3.fromRGB(60, 255, 60)
+    highlight.FillTransparency = 0.6
+    highlight.OutlineColor = isEnemy and Color3.fromRGB(255, 0, 0) or Color3.fromRGB(0, 255, 0)
+    highlight.OutlineTransparency = 0.1
+    highlight.Adornee = model
+    highlight.Parent = model
+    activeESP[model] = highlight
+end
+
+local function removeESP(model)
+    if activeESP[model] then activeESP[model]:Destroy(); activeESP[model] = nil; end
+end
+
+local function setupFolderTracking(folder, isEnemy)
+    for _, child in ipairs(folder:GetChildren()) do if child:IsA("Model") and child ~= plr.Character then createESP(child, isEnemy) end end
+    folder.ChildAdded:Connect(function(child) task.wait(0.1); if child:IsA("Model") and child ~= plr.Character then createESP(child, isEnemy) end end)
+    folder.ChildRemoved:Connect(function(child) removeESP(child) end)
+end
+setupFolderTracking(Chars, false)
+setupFolderTracking(Enemies, true)
+
+-- Watch for ESP Toggle changes to refresh states
+task.spawn(function()
+    while task.wait(0.5) do
+        if not getgenv().ESPEnabled then
+            for model, _ in pairs(activeESP) do removeESP(model) end
+        else
+            for _, child in ipairs(Chars:GetChildren()) do if child:IsA("Model") and child ~= plr.Character then createESP(child, false) end end
+            for _, child in ipairs(Enemies:GetChildren()) do if child:IsA("Model") and child ~= plr.Character then createESP(child, true) end end
+        end
+    end
+end)
+
+-- ============================================================================
+-- CORE RENDERING & UI GENERATION
+-- ============================================================================
+
+-- FOV Ring Drawing
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Color = Color3.fromRGB(0, 255, 200)
+FOVCircle.Thickness = 1.5
+FOVCircle.NumSides = 64
+FOVCircle.Radius = getgenv().fov
+FOVCircle.Filled = false
+FOVCircle.Visible = getgenv().FOVVisible
+
+-- Premium ScreenGui Initialization
+local TargetGui = Instance.new("ScreenGui")
+TargetGui.Name = "PremiumVisualSuite"
+TargetGui.ResetOnSpawn = false
+local success, _ = pcall(function() TargetGui.Parent = CoreGui end)
+if not success then TargetGui.Parent = plr:WaitForChild("PlayerGui") end
+
+-- ----------------------------------------------------------------------------
+-- TARGET INTERFACE HUD
+-- ----------------------------------------------------------------------------
+local HUDFrame = Instance.new("Frame")
+HUDFrame.Size = UDim2.new(0, 340, 0, 65)
+HUDFrame.Position = UDim2.new(0.5, -170, 0.82, 0)
+HUDFrame.BackgroundColor3 = Color3.fromRGB(11, 11, 14)
+HUDFrame.BackgroundTransparency = 0.15
+HUDFrame.ClipsDescendants = true
+HUDFrame.Visible = false
+HUDFrame.Parent = TargetGui
+
+local HUDCorner = Instance.new("UICorner", HUDFrame)
+HUDCorner.CornerRadius = UDim.new(0, 8)
+
+local UIStroke = Instance.new("UIStroke", HUDFrame)
+UIStroke.Color = Color3.fromRGB(0, 255, 200)
+UIStroke.Thickness = 1.5
+UIStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local GlowStrip = Instance.new("Frame", HUDFrame)
+GlowStrip.Size = UDim2.new(0, 4, 1, 0)
+GlowStrip.BackgroundColor3 = Color3.fromRGB(0, 255, 200)
+GlowStrip.BorderSizePixel = 0
+
+local NameLabel = Instance.new("TextLabel", HUDFrame)
+NameLabel.Size = UDim2.new(1, -25, 0, 22)
+NameLabel.Position = UDim2.new(0, 16, 0, 8)
+NameLabel.BackgroundTransparency = 1
+NameLabel.Font = Enum.Font.GothamBold
+NameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+NameLabel.TextSize = 14
+NameLabel.TextXAlignment = Enum.TextXAlignment.Left
+NameLabel.Text = "TARGET: NONE"
+
+local LevelLabel = Instance.new("TextLabel", HUDFrame)
+LevelLabel.Size = UDim2.new(0.5, -16, 0, 18)
+LevelLabel.Position = UDim2.new(0, 16, 0, 34)
+LevelLabel.BackgroundTransparency = 1
+LevelLabel.Font = Enum.Font.GothamSemibold
+LevelLabel.TextColor3 = Color3.fromRGB(0, 255, 200)
+LevelLabel.TextSize = 11
+LevelLabel.TextXAlignment = Enum.TextXAlignment.Left
+LevelLabel.Text = "LEVEL: --"
+
+local WeaponLabel = Instance.new("TextLabel", HUDFrame)
+WeaponLabel.Size = UDim2.new(0.5, -16, 0, 18)
+WeaponLabel.Position = UDim2.new(0.5, 0, 0, 34)
+WeaponLabel.BackgroundTransparency = 1
+WeaponLabel.Font = Enum.Font.GothamSemibold
+WeaponLabel.TextColor3 = Color3.fromRGB(235, 180, 50)
+WeaponLabel.TextSize = 11
+WeaponLabel.TextXAlignment = Enum.TextXAlignment.Right
+WeaponLabel.Text = "WEAPON: NONE"
+
+-- ----------------------------------------------------------------------------
+-- INTERACTIVE CONTROL MENU
+-- ----------------------------------------------------------------------------
+local MenuFrame = Instance.new("Frame")
+MenuFrame.Name = "ControlMenu"
+MenuFrame.Size = UDim2.new(0, 260, 0, 210)
+MenuFrame.Position = UDim2.new(0.5, -130, 0.4, -105)
+MenuFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+MenuFrame.BorderSizePixel = 0
+MenuFrame.Visible = true
+MenuFrame.Active = true
+MenuFrame.Parent = TargetGui
+
+local MenuCorner = Instance.new("UICorner", MenuFrame)
+MenuCorner.CornerRadius = UDim.new(0, 8)
+
+local MenuStroke = Instance.new("UIStroke", MenuFrame)
+MenuStroke.Color = Color3.fromRGB(0, 255, 200)
+MenuStroke.Thickness = 1.2
+
+local MenuTitle = Instance.new("TextLabel", MenuFrame)
+MenuTitle.Size = UDim2.new(1, -24, 0, 40)
+MenuTitle.Position = UDim2.new(0, 12, 0, 0)
+MenuTitle.BackgroundTransparency = 1
+MenuTitle.Font = Enum.Font.GothamBold
+MenuTitle.Text = "celestial"
+MenuTitle.TextColor3 = Color3.fromRGB(0, 255, 200)
+MenuTitle.TextSize = 13
+MenuTitle.TextXAlignment = Enum.TextXAlignment.Left
+
+local HintLabel = Instance.new("TextLabel", MenuFrame)
+HintLabel.Size = UDim2.new(1, -12, 0, 20)
+HintLabel.Position = UDim2.new(0, 0, 1, -22)
+HintLabel.BackgroundTransparency = 1
+HintLabel.Font = Enum.Font.Gotham
+HintLabel.Text = "Press [Right-Ctrl] to Hide Menu"
+HintLabel.TextColor3 = Color3.fromRGB(120, 120, 125)
+HintLabel.TextSize = 10
+HintLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Simple Dragging System for the Control Menu
+local dragging, dragInput, dragStart, startPos
+MenuFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = MenuFrame.Position
+        input.Changed:Connect(function() if input.UserInputState == Enum.UserInputState.End then dragging = false end end)
+    end
+end)
+MenuFrame.InputChanged:Connect(function(input) if input.UserInputType == Enum.UserInputType.MouseMovement then dragInput = input end end)
+UIS.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        MenuFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Toggle Creation Function
+local toggleCount = 0
+local function createMenuToggle(text, startState, callback)
+    local Frame = Instance.new("Frame", MenuFrame)
+    Frame.Size = UDim2.new(1, -24, 0, 36)
+    Frame.Position = UDim2.new(0, 12, 0, 45 + (toggleCount * 42))
+    Frame.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+    
+    local Corner = Instance.new("UICorner", Frame)
+    Corner.CornerRadius = UDim.new(0, 5)
+    
+    local Label = Instance.new("TextLabel", Frame)
+    Label.Size = UDim2.new(1, -60, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Font = Enum.Font.GothamSemibold
+    Label.Text = text
+    Label.TextColor3 = Color3.fromRGB(230, 230, 235)
+    Label.TextSize = 11
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    
+    local Box = Instance.new("Frame", Frame)
+    Box.Size = UDim2.new(0, 32, 0, 16)
+    Box.Position = UDim2.new(1, -42, 0.5, -8)
+    
+    local BoxCorner = Instance.new("UICorner", Box)
+    BoxCorner.CornerRadius = UDim.new(1, 0)
+    
+    local Circle = Instance.new("Frame", Box)
+    Circle.Size = UDim2.new(0, 12, 0, 12)
+    
+    local CircleCorner = Instance.new("UICorner", Circle)
+    CircleCorner.CornerRadius = UDim.new(1, 0)
+    Circle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    
+    local Button = Instance.new("TextButton", Frame)
+    Button.Size = UDim2.new(1, 0, 1, 0)
+    Button.BackgroundTransparency = 1
+    Button.Text = ""
+    
+    local active = startState
+    local function renderState(instant)
+        local tPos = active and UDim2.new(1, -14, 0.5, -6) or UDim2.new(0, 2, 0.5, -6)
+        local tCol = active and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(65, 65, 70)
+        if instant then
+            Circle.Position = tPos
+            Box.BackgroundColor3 = tCol
+        else
+            TweenService:Create(Circle, TweenInfo.new(0.12), {Position = tPos}):Play()
+            TweenService:Create(Box, TweenInfo.new(0.12), {BackgroundColor3 = tCol}):Play()
+        end
+    end
+    
+    Button.MouseButton1Click:Connect(function()
+        active = not active
+        renderState(false)
+        callback(active)
+    end)
+    
+    renderState(true)
+    toggleCount = toggleCount + 1
+end
+
+-- Hook up Menu Toggles to Global Configurations
+createMenuToggle("Silent Aim", getgenv().SilentAimEnabled, function(v) getgenv().SilentAimEnabled = v end)
+createMenuToggle("Player ESP", getgenv().ESPEnabled, function(v) getgenv().ESPEnabled = v end)
+createMenuToggle("Show FOV", getgenv().FOVVisible, function(v) getgenv().FOVVisible = v end)
+
+-- Keybind to open/close menu
+UIS.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightControl then
+        MenuFrame.Visible = not MenuFrame.Visible
+    end
+end)
+
+-- ----------------------------------------------------------------------------
+-- BACKPACK & CHARACTER MODEL WEAPON SCANNER
+-- ----------------------------------------------------------------------------
+local function discoverEquippedWeapon(targetModel, targetPlayer)
+    local characterWeapons = {}
+    for _, item in ipairs(targetModel:GetChildren()) do
+        if item:IsA("Model") or item:IsA("Folder") then
+            characterWeapons[item.Name:lower()] = item.Name
+        end
+    end
+
+    if targetPlayer then
+        local backpack = targetPlayer:FindFirstChildOfClass("Backpack")
+        if backpack then
+            for _, config in ipairs(ic:GetChildren()) do
+                local weaponName = config.Name:lower()
+                
+                if characterWeapons[weaponName] then
+                    return characterWeapons[weaponName]
+                end
+                
+                local inventoryInstance = backpack:FindFirstChild(config.Name)
+                if not inventoryInstance and targetModel:FindFirstChild(config.Name, true) then
+                    return config.Name
+                end
+            end
+        end
+    end
+
+    for _, config in ipairs(ic:GetChildren()) do
+        if targetModel:FindFirstChild(config.Name, true) then
+            return config.Name
+        end
+    end
+
+    return "UNARMED"
+end
+
+-- Runtime Interface Update Loop
+local isUiShowing = false
+local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+RunService.RenderStepped:Connect(function()
+    local mouseLoc = isMobile and Vector2.new(cam.ViewportSize.X/2, cam.ViewportSize.Y/2) or UIS:GetMouseLocation()
+    FOVCircle.Position = mouseLoc
+    FOVCircle.Radius = getgenv().fov
+    FOVCircle.Visible = getgenv().FOVVisible
+    
+    local currentTargetPart = getTarget(cam.CFrame.Position)
+    if currentTargetPart and currentTargetPart.Parent then
+        local targetModel = currentTargetPart.Parent
+        local targetPlayer = Players:GetPlayerFromCharacter(targetModel)
+        
+        local textName = string.upper(targetModel.Name)
+        local textLevel = "LEVEL: --"
+        local discoveredWeapon = discoverEquippedWeapon(targetModel, targetPlayer)
+        local textWeapon = "WEAPON: " .. string.upper(discoveredWeapon)
+        
+        if targetPlayer then
+            local stats = targetPlayer:FindFirstChild("leaderstats")
+            local lvlObj = stats and (stats:FindFirstChild("Level") or stats:FindFirstChild("Lvl"))
+            if lvlObj then
+                textLevel = "LEVEL: " .. tostring(lvlObj.Value)
+            end
+            NameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            local hum = targetModel:FindFirstChildOfClass("Humanoid")
+            if hum then
+                textLevel = "HP: " .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
+            end
+            NameLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+            textName = "[NPC] " .. textName
+        end
+        
+        NameLabel.Text = textName
+        LevelLabel.Text = textLevel
+        WeaponLabel.Text = textWeapon
+        
+        if not isUiShowing and getgenv().SilentAimEnabled then
+            isUiShowing = true
+            HUDFrame.Visible = true
+            HUDFrame.Size = UDim2.new(0, 340, 0, 0)
+            TweenService:Create(HUDFrame, tweenInfo, {Size = UDim2.new(0, 340, 0, 65)}):Play()
+        end
+    else
+        if isUiShowing or not getgenv().SilentAimEnabled then
+            isUiShowing = false
+            local closeTween = TweenService:Create(HUDFrame, tweenInfo, {Size = UDim2.new(0, 340, 0, 0)})
+            closeTween.Completed:Connect(function()
+                if not isUiShowing then HUDFrame.Visible = false end
+            end)
+            closeTween:Play()
+        end
+    end
+end)
