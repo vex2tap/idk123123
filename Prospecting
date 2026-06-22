@@ -1,24 +1,28 @@
 -- ================= CONFIGURATION =================
-local CYCLES_BEFORE_SELL = 3        -- default
-local SELL_DURATION = 5
-local SELL_INTERVAL = 2
-local FIRE_INTERVAL = 0.1
-local CLICK_INTERVAL = 0.1         -- Speed of the constant clicking in water
+local CYCLES_BEFORE_SELL = 3        
+local SELL_DURATION = 4             
+local SELL_INTERVAL = 1.5           
+local FIRE_INTERVAL = 0.1           
+local CLICK_INTERVAL = 0.1         
+local TWEEN_SPEED = 50             
+local UI_KEYBIND = Enum.KeyCode.RightShift
 -- =================================================
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local VirtualInputManager = game:GetService("VirtualInputManager") 
+local RunService = game:GetService("RunService")
 local localPlayer = Players.LocalPlayer
 local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
 local rootPart = character:WaitForChild("HumanoidRootPart")
 
--- Stored positions (initially nil)
 local SandPos = nil
 local WaterPos = nil
+local running = false
+local loopTask = nil
 
--- ========== DETECT EQUIPPED PAN ==========
+-- ========== CORE GAME UTILITIES ==========
 local function findPanTool()
     for _, child in ipairs(character:GetChildren()) do
         if child:IsA("Tool") then
@@ -31,7 +35,6 @@ local function findPanTool()
     return nil
 end
 
--- ========== GET FILL STATUS ==========
 local function getFillStatus()
     local playerGui = localPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return nil, nil end
@@ -43,588 +46,628 @@ local function getFillStatus()
     if not fillText or not fillText:IsA("TextLabel") then return nil, nil end
     local text = fillText.Text
     local current, max = text:match("(%d+)/(%d+)")
-    if current and max then
-        return tonumber(current), tonumber(max)
-    end
+    if current and max then return tonumber(current), tonumber(max) end
     return nil, nil
-end
-
--- ========== REMOTE FUNCTIONS ==========
-local function getRemotes(tool)
-    if not tool then return nil, nil, nil end
-    local scripts = tool:FindFirstChild("Scripts")
-    if not scripts then return nil, nil, nil end
-    return scripts:FindFirstChild("Pan"),
-           scripts:FindFirstChild("Shake"),
-           scripts:FindFirstChild("Collect")
 end
 
 local function fireRemotes(tool)
     if not tool then return end
-    local panRemote, shakeRemote, collectRemote = getRemotes(tool)
+    local scripts = tool:FindFirstChild("Scripts")
+    if not scripts then return end
+    local panRemote = scripts:FindFirstChild("Pan")
+    local shakeRemote = scripts:FindFirstChild("Shake")
+    local collectRemote = scripts:FindFirstChild("Collect")
+    
     if panRemote then pcall(panRemote.InvokeServer, panRemote) end
     if shakeRemote then pcall(shakeRemote.FireServer, shakeRemote) end
     if collectRemote then pcall(collectRemote.InvokeServer, collectRemote, 1, false) end
 end
 
--- ========== SELLING ==========
-local function getSellPosition()
-    local map = workspace:FindFirstChild("Map")
-    if not map then return nil end
-    local starterTown = map:FindFirstChild("StarterTown")
-    if not starterTown then return nil end
-    local details = starterTown:FindFirstChild("Details")
-    if not details then return nil end
-    local children = details:GetChildren()
-    if #children >= 12 then
-        local sellPart = children[12]
-        if sellPart:IsA("BasePart") then
-            return sellPart.Position
-        end
-    end
-    return nil
-end
-
 local function sellAll()
-    local remote = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-    if remote then remote = remote:FindFirstChild("Shop") end
-    if remote then remote = remote:FindFirstChild("SellAll") end
-    if remote then
-        pcall(remote.InvokeServer, remote)
-        return true
+    local replicatedStorage = game:GetService("ReplicatedStorage")
+    local remotes = replicatedStorage:FindFirstChild("Remotes") or replicatedStorage:FindFirstChild("Remote")
+    if not remotes then return false end
+    local shop = remotes:FindFirstChild("Shop")
+    if not shop then return false end
+    local sellRemote = shop:FindFirstChild("SellAll") or shop:FindFirstChild("Sell")
+    if sellRemote then
+        local success, _ = pcall(function() return sellRemote:InvokeServer() end)
+        return success
     end
     return false
 end
 
--- ========== FIXED ANTI-RUBBERBAND TELEPORT ==========
-local function teleport(pos)
-    if pos and rootPart then
-        rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-        
-        rootPart.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
-        
-        task.wait(0.1)
-        rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-        task.wait(0.1) 
-    end
-end
-
--- ========== MOUSE ACTIONS ==========
-local function holdClick()
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-end
-
-local function releaseClick()
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-end
-
--- ========== FARM UNTIL FULL ==========
-local function farmUntilFull(pos, tool)
-    teleport(pos)
-    print("Farming in Sand...")
-    task.wait(0.2) 
-    
-    holdClick() -- Hold down click normally for sand filling
-    
-    while true do
-        if not running or not character or not character:FindFirstChild("HumanoidRootPart") then break end
-        
-        local current, max = getFillStatus()
-        if current and max then
-            if current >= max then
-                print("Pan full! Current:", current, "/", max)
-                break
+local function getClosestMerchantPosition()
+    if not rootPart then return nil end
+    local closestPos = nil
+    local shortestDistance = math.huge
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if string.lower(obj.Name) == "merchant" then
+            local targetPos = obj:IsA("BasePart") and obj.Position or (obj:IsA("Model") and obj:GetPivot().Position)
+            if targetPos then
+                local distance = (rootPart.Position - targetPos).Magnitude
+                if distance < shortestDistance then
+                    shortestDistance = distance
+                    closestPos = targetPos
+                end
             end
         end
-        
+    end
+    return closestPos
+end
+
+local function tweenToPosition(targetPos)
+    if not rootPart or not targetPos then return end
+    local distance = (rootPart.Position - targetPos).Magnitude
+    local duration = distance / TWEEN_SPEED
+    rootPart.AssemblyLinearVelocity = Vector3.new(0,0,0)
+    rootPart.AssemblyAngularVelocity = Vector3.new(0,0,0)
+    
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = CFrame.new(targetPos + Vector3.new(0, 1.5, 0))})
+    
+    local transitNoclip = RunService.Stepped:Connect(function()
+        if character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end
+    end)
+    
+    tween:Play()
+    tween.Completed:Wait()
+    transitNoclip:Disconnect()
+    rootPart.AssemblyLinearVelocity = Vector3.new(0,0,0)
+    task.wait(0.1)
+end
+
+local function holdClick() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1) end
+local function releaseClick() VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1) end
+
+local function farmUntilFull(pos, tool)
+    tweenToPosition(pos)
+    task.wait(0.1) 
+    holdClick()
+    while true do
+        if not running or not character or not character:FindFirstChild("HumanoidRootPart") then break end
+        local current, max = getFillStatus()
+        if current and max and current >= max then break end
         fireRemotes(tool)
         task.wait(FIRE_INTERVAL)
     end
-    
     releaseClick() 
 end
 
--- ========== RINSE UNTIL EMPTY (CONSTANT CLICKING) ==========
 local function rinseUntilEmpty(pos, tool)
-    teleport(pos)
-    print("Rinsing in Water...")
-    task.wait(0.2)
-    
+    tweenToPosition(pos)
+    task.wait(0.1)
     while true do
         if not running or not character or not character:FindFirstChild("HumanoidRootPart") then break end
-        
         local current, max = getFillStatus()
-        if current and max then
-            if current == 0 then
-                print("Pan empty! Current:", current, "/", max)
-                break
-            end
-        end
-        
-        -- Simulate a rapid physical click cycle (Press -> Release)
-        holdClick()
-        task.wait(CLICK_INTERVAL / 2)
-        releaseClick()
-        
-        fireRemotes(tool)
-        task.wait(CLICK_INTERVAL / 2)
+        if current and max and current == 0 then break end
+        holdClick() task.wait(CLICK_INTERVAL / 2) releaseClick()
+        fireRemotes(tool) task.wait(CLICK_INTERVAL / 2)
     end
-    
-    releaseClick() -- Safety release when moving to next phase
+    releaseClick() 
 end
 
--- ========== LOCKED NPC SELL LOOP ==========
+-- ================= AUTOMATION LOOP SYSTEM FUNCTIONS =================
+local cyclesThisBatch = 0
+local totalCycles = 0
+
+-- UI Forward Declarations (Updated dynamically by loop)
+local runStatusLabel, liveLocationLabel, liveFillLabel, liveCyclesLabel
+
+local function refreshAnalyticsDisplay()
+    if not liveFillLabel or not liveCyclesLabel then return end
+    local current, max = getFillStatus()
+    if current and max then liveFillLabel.Text = "Cargo Matrix Load: 📦 Load: " .. current .. "/" .. max else liveFillLabel.Text = "Cargo Matrix Load: 📦 Load: 0/0" end
+    liveCyclesLabel.Text = "Batch Sequence loops: 📊 Cycles: " .. cyclesThisBatch .. "/" .. CYCLES_BEFORE_SELL .. " (Sessions: " .. totalCycles .. ")"
+end
+
 local function doSell(sellDuration, sellInterval)
-    local sellPos = getSellPosition()
+    local sellPos = getClosestMerchantPosition()
     if not sellPos then
-        print("Sell position not found")
-        return
+        if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⚠️ RUNTIME CRITICAL - MERCHANT MISSING" end
+        running = false
+        return false 
     end
-    
-    print("Selling at NPC for", sellDuration, "seconds...")
-    local start = tick()
     
     releaseClick() 
+    if liveLocationLabel then liveLocationLabel.Text = "Target Vector: 📍 Synchronizing Merchant Hub" end
+    tweenToPosition(sellPos)
     
-    while (tick() - start) < sellDuration do
-        if not running then break end
-        teleport(sellPos) 
-        sellAll()         
-        task.wait(sellInterval)
-    end
-    print("Selling complete.")
-end
-
--- ========== TUTORIAL POPUP ==========
-local function showTutorial()
-    local tutorialGui = Instance.new("ScreenGui")
-    tutorialGui.Name = "TutorialGui"
-    tutorialGui.Parent = localPlayer:WaitForChild("PlayerGui")
-    tutorialGui.ResetOnSpawn = false
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 440, 0, 280)
-    frame.Position = UDim2.new(0.5, -220, 0.5, -140)
-    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    frame.BorderSizePixel = 0
-    frame.Parent = tutorialGui
-
-    local tCorner = Instance.new("UICorner")
-    tCorner.CornerRadius = UDim.new(0, 12)
-    tCorner.Parent = frame
-
-    local tStroke = Instance.new("UIStroke")
-    tStroke.Color = Color3.fromRGB(168, 85, 247)
-    tStroke.Thickness = 1
-    tStroke.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 50)
-    title.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
-    title.Text = "  ✨ Prospector Tutorial"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.TextSize = 16
-    title.Font = Enum.Font.GothamBold
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = frame
-
-    local titleCorner = Instance.new("UICorner")
-    titleCorner.CornerRadius = UDim.new(0, 12)
-    titleCorner.Parent = title
-
-    local text = Instance.new("TextLabel")
-    text.Size = UDim2.new(1, -32, 0, 140)
-    text.Position = UDim2.new(0, 16, 0, 65)
-    text.BackgroundTransparency = 1
-    text.Text = "1. Equip your pan.\n2. Stand on the sand – click 'Set Sand Position'.\n3. Stand in the water – click 'Set Water Position'.\n4. Set how many cycles before selling.\n5. Click 'Start'.\n\nThe script will automatically fill, rinse, and sell."
-    text.TextColor3 = Color3.fromRGB(156, 163, 175)
-    text.TextXAlignment = Enum.TextXAlignment.Left
-    text.TextYAlignment = Enum.TextYAlignment.Top
-    text.TextSize = 13
-    text.Font = Enum.Font.GothamMedium
-    text.Parent = frame
-
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.new(0, 140, 0, 36)
-    closeBtn.Position = UDim2.new(0.5, -70, 1, -52)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
-    closeBtn.BorderSizePixel = 0
-    closeBtn.Text = "Got it!"
-    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    closeBtn.TextSize = 13
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.Parent = frame
-
-    local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 8)
-    btnCorner.Parent = closeBtn
-
-    closeBtn.MouseButton1Click:Connect(function()
-        tutorialGui:Destroy()
+    local startTime = tick()
+    local lastSellInvoke = 0
+    
+    local lockConnection = RunService.Stepped:Connect(function()
+        if (tick() - startTime) >= sellDuration or not running then return end
+        if character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end
+        if rootPart then
+            rootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            rootPart.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+            rootPart.CFrame = CFrame.new(sellPos + Vector3.new(0, 0.5, 0))
+        end
     end)
-end
-
--- ========== MAIN GUI ==========
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "ProspectorGUI"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
-
-task.wait(0.5)
-showTutorial()
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 360, 0, 440)
-mainFrame.Position = UDim2.new(0.5, -180, 0.5, -220)
-mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-mainFrame.BorderSizePixel = 0
-mainFrame.ClipsDescendants = true
-mainFrame.Parent = screenGui
-
-local mainCorner = Instance.new("UICorner")
-mainCorner.CornerRadius = UDim.new(0, 14)
-mainCorner.Parent = mainFrame
-
-local mainStroke = Instance.new("UIStroke")
-mainStroke.Color = Color3.fromRGB(40, 40, 50)
-mainStroke.Thickness = 1
-mainStroke.Parent = mainFrame
-
-local dragToggle, dragStart, startPos
-mainFrame.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragToggle = true
-        dragStart = input.Position
-        startPos = mainFrame.Position
+    
+    while (tick() - startTime) < sellDuration do
+        if not running then break end
+        if (tick() - lastSellInvoke) >= sellInterval then
+            sellAll()         
+            lastSellInvoke = tick()
+        end
+        task.wait(0.1) 
     end
-end)
-mainFrame.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragToggle = false
-    end
-end)
-UserInputService.InputChanged:Connect(function(input)
-    if dragToggle and input.UserInputType == Enum.UserInputType.MouseMovement then
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-    end
-end)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 45)
-title.Position = UDim2.new(0, 0, 0, 0)
-title.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
-title.BorderSizePixel = 0
-title.Text = "  ✨ Prospector celestial"
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.TextSize = 14
-title.Font = Enum.Font.GothamBold
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = mainFrame
-
-local titleCorner = Instance.new("UICorner")
-titleCorner.CornerRadius = UDim.new(0, 14)
-titleCorner.Parent = title
-
-local accentLine = Instance.new("Frame")
-accentLine.Size = UDim2.new(1, 0, 0, 2)
-accentLine.Position = UDim2.new(0, 0, 0, 43)
-accentLine.BorderSizePixel = 0
-accentLine.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
-accentLine.Parent = mainFrame
-
-local layoutContainer = Instance.new("Frame")
-layoutContainer.Size = UDim2.new(1, -32, 1, -120)
-layoutContainer.Position = UDim2.new(0, 16, 0, 60)
-layoutContainer.BackgroundTransparency = 1
-layoutContainer.Parent = mainFrame
-
-local uiListLayout = Instance.new("UIListLayout")
-uiListLayout.Padding = UDim.new(0, 8)
-uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-uiListLayout.Parent = layoutContainer
-
-local function createStatusLabel(text, color, order)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, 0, 0, 28)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = text
-    lbl.TextColor3 = color
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.TextSize = 13
-    lbl.Font = Enum.Font.GothamMedium
-    lbl.LayoutOrder = order
-    lbl.Parent = layoutContainer
-    return lbl
+    
+    lockConnection:Disconnect()
+    return true
 end
 
-local statusLabel = createStatusLabel("⏳ Set positions first", Color3.fromRGB(156, 163, 175), 1)
-local locationLabel = createStatusLabel("📍 Location: Not set", Color3.fromRGB(34, 197, 94), 2)
-local fillLabel = createStatusLabel("📦 Fill: 0/0", Color3.fromRGB(234, 179, 8), 3)
-local currentCycleLabel = createStatusLabel("📊 Current Cycle: 0/" .. CYCLES_BEFORE_SELL, Color3.fromRGB(59, 130, 246), 6)
-local totalCycleLabel = createStatusLabel("🔄 Total Cycles: 0", Color3.fromRGB(168, 85, 247), 7)
-local toolLabel = createStatusLabel("🔧 Tool: Not found", Color3.fromRGB(249, 115, 22), 8)
-
-local btnFrame = Instance.new("Frame")
-btnFrame.Size = UDim2.new(1, 0, 0, 36)
-btnFrame.BackgroundTransparency = 1
-btnFrame.LayoutOrder = 4
-btnFrame.Parent = layoutContainer
-
-local btnLayout = Instance.new("UIListLayout")
-btnLayout.FillDirection = Enum.FillDirection.Horizontal
-btnLayout.Padding = UDim.new(0, 10)
-btnLayout.Parent = btnFrame
-
-local function styleActionBtn(btn, text, bg)
-    btn.BackgroundColor3 = bg
-    btn.BorderSizePixel = 0
-    btn.Text = text
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.TextSize = 12
-    btn.Font = Enum.Font.GothamBold
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
-    local bStroke = Instance.new("UIStroke")
-    bStroke.Color = Color3.fromRGB(45, 45, 60)
-    bStroke.Thickness = 1
-    bStroke.Parent = btn
-end
-
-local sandBtn = Instance.new("TextButton")
-sandBtn.Size = UDim2.new(0.5, -5, 1, 0)
-sandBtn.Parent = btnFrame
-styleActionBtn(sandBtn, "🟫 Set Sand", Color3.fromRGB(26, 26, 36))
-
-sandBtn.MouseButton1Click:Connect(function()
-    local pos = rootPart.Position
-    SandPos = pos
-    locationLabel.Text = "📍 Sand: " .. math.floor(pos.X) .. ", " .. math.floor(pos.Y) .. ", " .. math.floor(pos.Z)
-    print("Sand position set to:", pos)
-end)
-
-local waterBtn = Instance.new("TextButton")
-waterBtn.Size = UDim2.new(0.5, -5, 1, 0)
-waterBtn.Parent = btnFrame
-styleActionBtn(waterBtn, "💧 Set Water", Color3.fromRGB(26, 26, 36))
-
-waterBtn.MouseButton1Click:Connect(function()
-    local pos = rootPart.Position
-    WaterPos = pos
-    locationLabel.Text = "📍 Water: " .. math.floor(pos.X) .. ", " .. math.floor(pos.Y) .. ", " .. math.floor(pos.Z)
-    print("Water position set to:", pos)
-end)
-
-local configFrame = Instance.new("Frame")
-configFrame.Size = UDim2.new(1, 0, 0, 36)
-configFrame.BackgroundTransparency = 1
-configFrame.LayoutOrder = 5
-configFrame.Parent = layoutContainer
-
-local cyclesLabel = Instance.new("TextLabel")
-cyclesLabel.Size = UDim2.new(0, 120, 1, 0)
-cyclesLabel.BackgroundTransparency = 1
-cyclesLabel.Text = "🔄 Cycles / Sell:"
-cyclesLabel.TextColor3 = Color3.fromRGB(156, 163, 175)
-cyclesLabel.TextXAlignment = Enum.TextXAlignment.Left
-cyclesLabel.TextSize = 13
-cyclesLabel.Font = Enum.Font.GothamMedium
-cyclesLabel.Parent = configFrame
-
-local cyclesBox = Instance.new("TextBox")
-cyclesBox.Size = UDim2.new(0, 70, 1, 0)
-cyclesBox.Position = UDim2.new(0, 120, 0, 0)
-cyclesBox.BackgroundColor3 = Color3.fromRGB(26, 26, 36)
-cyclesBox.BorderSizePixel = 0
-cyclesBox.Text = tostring(CYCLES_BEFORE_SELL)
-cyclesBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-cyclesBox.TextSize = 13
-cyclesBox.Font = Enum.Font.GothamMedium
-cyclesBox.Parent = configFrame
-
-local boxCorner = Instance.new("UICorner")
-boxCorner.CornerRadius = UDim.new(0, 8)
-boxCorner.Parent = cyclesBox
-
-local boxStroke = Instance.new("UIStroke")
-boxStroke.Color = Color3.fromRGB(45, 45, 60)
-boxStroke.Thickness = 1
-boxStroke.Parent = cyclesBox
-
-cyclesBox.FocusLost:Connect(function()
-    local val = tonumber(cyclesBox.Text)
-    if val and val > 0 then CYCLES_BEFORE_SELL = val end
-end)
-
-local toggleButton = Instance.new("TextButton")
-toggleButton.Size = UDim2.new(0, 140, 0, 38)
-toggleButton.Position = UDim2.new(0.5, -70, 1, -54)
-toggleButton.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
-toggleButton.BorderSizePixel = 0
-toggleButton.Text = "▶️ Start"
-toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggleButton.TextSize = 13
-toggleButton.Font = Enum.Font.GothamBold
-toggleButton.Parent = mainFrame
-
-local toggleCorner = Instance.new("UICorner")
-toggleCorner.CornerRadius = UDim.new(0, 8)
-toggleCorner.Parent = toggleButton
-
-local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 24, 0, 24)
-closeBtn.Position = UDim2.new(1, -34, 0, 10)
-closeBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-closeBtn.BorderSizePixel = 0
-closeBtn.Text = "X"
-closeBtn.TextColor3 = Color3.fromRGB(156, 163, 175)
-closeBtn.TextSize = 11
-closeBtn.Font = Enum.Font.GothamBold
-closeBtn.Parent = mainFrame
-
-local closeCorner = Instance.new("UICorner")
-closeCorner.CornerRadius = UDim.new(0, 6)
-closeCorner.Parent = closeBtn
-
-closeBtn.MouseEnter:Connect(function()
-    TweenService:Create(closeBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(239, 68, 68), TextColor3 = Color3.fromRGB(255, 255, 255)}):Play()
-end)
-closeBtn.MouseLeave:Connect(function()
-    TweenService:Create(closeBtn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(30, 30, 40), TextColor3 = Color3.fromRGB(156, 163, 175)}):Play()
-end)
-
-closeBtn.MouseButton1Click:Connect(function()
-    running = false
-    releaseClick()
-    if loopTask then task.cancel(loopTask) end
-    screenGui:Destroy()
-end)
-
--- ========== MAIN LOOP ==========
-running = false
-loopTask = nil
-currentTool = nil
-cyclesThisBatch = 0
-totalCycles = 0
-
-Players.LocalPlayer.CharacterAdded:Connect(function(newChar)
-    character = newChar
-    rootPart = newChar:WaitForChild("HumanoidRootPart")
-end)
-
-local function updateFillLabel()
-    local current, max = getFillStatus()
-    if current and max then
-        fillLabel.Text = "📦 Fill: " .. current .. "/" .. max
-    else
-        fillLabel.Text = "📦 Fill: N/A"
-    end
-end
-
-local function updateCycleUI()
-    currentCycleLabel.Text = "📊 Current Cycle: " .. cyclesThisBatch .. "/" .. CYCLES_BEFORE_SELL
-    totalCycleLabel.Text = "🔄 Total Cycles: " .. totalCycles
-end
-
-function startLoop()
+local function startLoop()
     if running then return end
     if not SandPos or not WaterPos then
-        statusLabel.Text = "⚠️ Set Sand AND Water positions first!"
+        if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⚠️ COMPILER VOID - VECTORS EMPTY" end
         return
     end
-    currentTool = findPanTool()
+    local currentTool = findPanTool()
     if not currentTool then
-        statusLabel.Text = "⚠️ No pan equipped"
-        toolLabel.Text = "🔧 Tool: None"
+        if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⚠️ IO ACCESS BLOCK - NO PAN EQUIPPED" end
         return
     end
-    toolLabel.Text = "🔧 Tool: " .. currentTool.Name
+    
     running = true
-    toggleButton.Text = "⏹️ Stop"
-    toggleButton.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
-    statusLabel.Text = "🔄 Running..."
+    if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⚡ Automated Execution Sequences Live" end
     cyclesThisBatch = 0
-    totalCycles = 0
-    updateCycleUI()
+    refreshAnalyticsDisplay()
     
     loopTask = task.spawn(function()
         while running do
             currentTool = findPanTool()
             if not currentTool then
-                statusLabel.Text = "⚠️ Lost tool"
+                if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⚠️ PROCESS SHUTDOWN - PAN UNRESOLVED" end
                 running = false
                 break
             end
-            toolLabel.Text = "🔧 Tool: " .. currentTool.Name
 
-            -- Step 1: Farm in Sand until full
-            statusLabel.Text = "🔄 Running..."
-            locationLabel.Text = "📍 Location: Sand (Filling)"
+            if liveLocationLabel then liveLocationLabel.Text = "Target Vector: 📍 Extracting Ground Strata" end
             farmUntilFull(SandPos, currentTool)
             if not running then break end
 
-            -- Step 2: Rinse in Water until empty (WITH RAPID CLICKING)
-            locationLabel.Text = "📍 Location: Water (Rinsing)"
+            if liveLocationLabel then liveLocationLabel.Text = "Target Vector: 📍 Washing Processing Matrix" end
             rinseUntilEmpty(WaterPos, currentTool)
             if not running then break end
 
-            -- Increment cycles
             cyclesThisBatch = cyclesThisBatch + 1
             totalCycles = totalCycles + 1
-            updateCycleUI()
+            refreshAnalyticsDisplay()
 
-            -- Step 3: If we've reached the cycle target, go sell
             if cyclesThisBatch >= CYCLES_BEFORE_SELL then
-                locationLabel.Text = "📍 Location: Selling"
-                doSell(SELL_DURATION, SELL_INTERVAL)
-                if not running then break end
+                local sellSuccess = doSell(SELL_DURATION, SELL_INTERVAL)
+                if not sellSuccess or not running then break end
                 cyclesThisBatch = 0
-                updateCycleUI()
+                refreshAnalyticsDisplay()
             end
-            
             task.wait(0.3)
         end
         running = false
-        releaseClick()
-        toggleButton.Text = "▶️ Start"
-        toggleButton.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
-        if statusLabel.Text == "🔄 Running..." or statusLabel.Text == "⏹️ Stopped" then
-            statusLabel.Text = "⏹️ Stopped"
-        end
     end)
 end
 
-function stopLoop()
+local function stopLoop()
     running = false
     releaseClick()
     if loopTask then task.cancel(loopTask) end
-    toggleButton.Text = "▶️ Start"
-    toggleButton.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
-    statusLabel.Text = "⏹️ Stopped"
+    if runStatusLabel then runStatusLabel.Text = "Engine Matrix: ⏹️ Sequence Suspended Safely" end
 end
 
-toggleButton.MouseButton1Click:Connect(function()
-    if running then
-        stopLoop()
-    else
-        startLoop()
+
+-- ================= INTERFACE GENERATION ENGINE =================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "CelestialPremium"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+-- Main Window Frame
+local mainWindow = Instance.new("Frame")
+mainWindow.Size = UDim2.new(0, 440, 0, 480)
+mainWindow.Position = UDim2.new(0.5, -220, 0.5, -240)
+mainWindow.BackgroundColor3 = Color3.fromRGB(15, 17, 23)
+mainWindow.BorderSizePixel = 0
+mainWindow.ClipsDescendants = true
+mainWindow.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner") mainCorner.CornerRadius = UDim.new(0, 12) mainCorner.Parent = mainWindow
+local mainStroke = Instance.new("UIStroke") mainStroke.Thickness = 1.5 mainStroke.Color = Color3.fromRGB(138, 43, 226) mainStroke.Parent = mainWindow
+
+-- Ambient Particle Layer
+local particleContainer = Instance.new("Frame")
+particleContainer.Size = UDim2.new(1, 0, 1, 0)
+particleContainer.BackgroundTransparency = 1
+particleContainer.ClipsDescendants = true
+particleContainer.Parent = mainWindow
+
+task.spawn(function()
+    while mainWindow and mainWindow.Parent do
+        if mainWindow.Visible then
+            local p = Instance.new("Frame")
+            p.Size = UDim2.new(0, math.random(2,4), 0, math.random(2,4))
+            p.Position = UDim2.new(math.random(), 0, 1, 10)
+            p.BackgroundColor3 = math.random() > 0.5 and Color3.fromRGB(0, 229, 255) or Color3.fromRGB(138, 43, 226)
+            p.BackgroundTransparency = 0.5
+            p.Parent = particleContainer
+            Instance.new("UICorner", p).CornerRadius = UDim.new(1,0)
+            
+            TweenService:Create(p, TweenInfo.new(math.random(4,7)), {
+                Position = UDim2.new(p.Position.X.Scale, 0, -0.1, 0),
+                BackgroundTransparency = 1
+            }):Play()
+            game:GetService("Debris"):AddItem(p, 7)
+        end
+        task.wait(0.75)
     end
 end)
 
+-- Draggable Setup Handles
+local dragToggle, dragStart, startPos
+mainWindow.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragToggle = true dragStart = input.Position startPos = mainWindow.Position
+    end
+end)
+mainWindow.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then dragToggle = false end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragToggle and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - dragStart
+        mainWindow.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Window Top Title Layout
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(0, 140, 0, 45)
+titleText.Position = UDim2.new(0, 16, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Text = "CELESTIAL"
+titleText.TextColor3 = Color3.fromRGB(0, 229, 255)
+titleText.TextSize = 16
+titleText.Font = Enum.Font.GothamBold
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Parent = mainWindow
+
+local statusIndicator = Instance.new("Frame")
+statusIndicator.Size = UDim2.new(0, 7, 0, 7)
+statusIndicator.Position = UDim2.new(0, 112, 0, 20)
+statusIndicator.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
+statusIndicator.Parent = mainWindow
+Instance.new("UICorner", statusIndicator).CornerRadius = UDim.new(1, 0)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0, 50, 0, 45)
+statusLabel.Position = UDim2.new(0, 124, 0, 0)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Online"
+statusLabel.TextColor3 = Color3.fromRGB(34, 197, 94)
+statusLabel.TextSize = 11
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = mainWindow
+
+-- Action Close & Minimize Handles
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -36, 0, 8)
+closeBtn.BackgroundColor3 = Color3.fromRGB(23, 26, 33)
+closeBtn.Text = "✕"
+closeBtn.TextColor3 = Color3.fromRGB(156, 163, 175)
+closeBtn.TextSize = 11
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.Parent = mainWindow
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+closeBtn.MouseButton1Click:Connect(function()
+    running = false releaseClick() if loopTask then task.cancel(loopTask) end screenGui:Destroy()
+end)
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.new(0, 28, 0, 28)
+minBtn.Position = UDim2.new(1, -70, 0, 8)
+minBtn.BackgroundColor3 = Color3.fromRGB(23, 26, 33)
+minBtn.Text = "—"
+minBtn.TextColor3 = Color3.fromRGB(156, 163, 175)
+minBtn.TextSize = 11
+minBtn.Font = Enum.Font.GothamBold
+minBtn.Parent = mainWindow
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+minBtn.MouseButton1Click:Connect(function()
+    mainWindow.Visible = false
+end)
+
+-- Main Scroll Frame Container (Fixed Canvas Size to prevent layout collapses)
+local mainScroll = Instance.new("ScrollingFrame")
+mainScroll.Size = UDim2.new(1, -32, 1, -65)
+mainScroll.Position = UDim2.new(0, 16, 0, 50)
+mainScroll.BackgroundTransparency = 1
+mainScroll.Active = true
+mainScroll.Selectable = true
+mainScroll.CanvasSize = UDim2.new(0, 0, 0, 480) -- Hardcoded safe height to bypass exploit glitches
+mainScroll.ScrollBarThickness = 3
+mainScroll.ScrollBarImageColor3 = Color3.fromRGB(138, 43, 226)
+mainScroll.Parent = mainWindow
+
+local scrollLayout = Instance.new("UIListLayout")
+scrollLayout.Padding = UDim.new(0, 12)
+scrollLayout.Parent = mainScroll
+
+-- Header Label Explicit for Farming Tab Focus
+local tabHeaderLabel = Instance.new("TextLabel")
+tabHeaderLabel.Size = UDim2.new(1, 0, 0, 20)
+tabHeaderLabel.BackgroundTransparency = 1
+tabHeaderLabel.Text = "🌾 FARMING HUB MODULE"
+tabHeaderLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+tabHeaderLabel.Font = Enum.Font.GothamBold
+tabHeaderLabel.TextSize = 13
+tabHeaderLabel.TextXAlignment = Enum.TextXAlignment.Left
+tabHeaderLabel.Parent = mainScroll
+
+-- Component Builder: Clean Card Base
+local function createCard(title, height)
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, height)
+    card.BackgroundColor3 = Color3.fromRGB(23, 26, 33)
+    card.BorderSizePixel = 0
+    card.Parent = mainScroll
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
+    
+    Instance.new("UIPadding", card).PaddingLeft = UDim.new(0, 15)
+    Instance.new("UIPadding", card).PaddingRight = UDim.new(0, 15)
+    Instance.new("UIPadding", card).PaddingTop = UDim.new(0, 12)
+    
+    local header = Instance.new("TextLabel")
+    header.Size = UDim2.new(1, 0, 0, 18)
+    header.BackgroundTransparency = 1
+    header.Text = string.upper(title)
+    header.TextColor3 = Color3.fromRGB(138, 43, 226)
+    header.TextSize = 10
+    header.Font = Enum.Font.GothamBold
+    header.TextXAlignment = Enum.TextXAlignment.Left
+    header.Parent = card
+    
+    return card
+end
+
+-- Card 1: Coordinate Allocations
+local vectorsCard = createCard("Vector Coordinates", 85)
+
+local function setupActionBtn(text, x, width, parent, cb)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, width, 0, 34)
+    btn.Position = UDim2.new(0, x, 0, 28)
+    btn.BackgroundColor3 = Color3.fromRGB(15, 17, 23)
+    btn.Text = text
+    btn.TextColor3 = Color3.fromRGB(0, 229, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local s = Instance.new("UIStroke", btn) s.Color = Color3.fromRGB(0, 229, 255) s.Thickness = 1
+    btn.MouseButton1Click:Connect(cb)
+end
+
+-- Symmetrically map actions inside vectorsCard boundaries 
+setupActionBtn("⚡ SAVE SAND VECTOR", 0, 180, vectorsCard, function()
+    if rootPart then
+        SandPos = rootPart.Position
+        if liveLocationLabel then liveLocationLabel.Text = "Target Vector: 📍 Extraction Point Locked" end
+    end
+end)
+
+setupActionBtn("💧 SAVE WATER VECTOR", 198, 180, vectorsCard, function()
+    if rootPart then
+        WaterPos = rootPart.Position
+        if liveLocationLabel then liveLocationLabel.Text = "Target Vector: 📍 Wash Reservoir Locked" end
+    end
+end)
+
+-- Card 2: Configuration Systems Controls
+local controlsCard = createCard("Dynamic Configurations", 195)
+
+local function createToggle(parent, labelText, yPos, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 30)
+    container.Position = UDim2.new(0, 0, 0, yPos)
+    container.BackgroundTransparency = 1
+    container.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 200, 1, 0)
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.BackgroundTransparency = 1
+    label.Parent = container
+
+    local switch = Instance.new("TextButton")
+    switch.Size = UDim2.new(0, 42, 0, 22)
+    switch.Position = UDim2.new(1, -42, 0.5, -11)
+    switch.BackgroundColor3 = Color3.fromRGB(40, 45, 55)
+    switch.Text = ""
+    switch.Parent = container
+    Instance.new("UICorner", switch).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 16, 0, 16)
+    knob.Position = UDim2.new(0, 3, 0.5, -8)
+    knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    knob.Parent = switch
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local state = false
+    switch.MouseButton1Click:Connect(function()
+        state = not state
+        TweenService:Create(knob, TweenInfo.new(0.18), {Position = state and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)}):Play()
+        TweenService:Create(switch, TweenInfo.new(0.18), {BackgroundColor3 = state and Color3.fromRGB(0, 229, 255) or Color3.fromRGB(40, 45, 55)}):Play()
+        callback(state)
+    end)
+end
+
+local function createSlider(parent, labelText, yPos, min, max, default, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 35)
+    container.Position = UDim2.new(0, 0, 0, yPos)
+    container.BackgroundTransparency = 1
+    container.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 150, 0, 16)
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.BackgroundTransparency = 1
+    label.Parent = container
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Size = UDim2.new(0, 50, 0, 16)
+    valueLabel.Position = UDim2.new(1, -50, 0, 0)
+    valueLabel.Text = tostring(default)
+    valueLabel.TextColor3 = Color3.fromRGB(0, 229, 255)
+    valueLabel.Font = Enum.Font.GothamBold
+    valueLabel.TextSize = 11
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Parent = container
+
+    local slideTrack = Instance.new("TextButton")
+    slideTrack.Size = UDim2.new(1, 0, 0, 6)
+    slideTrack.Position = UDim2.new(0, 0, 0, 24)
+    slideTrack.BackgroundColor3 = Color3.fromRGB(15, 17, 23)
+    slideTrack.Text = ""
+    slideTrack.Parent = container
+    Instance.new("UICorner", slideTrack).CornerRadius = UDim.new(1,0)
+
+    local slideFill = Instance.new("Frame")
+    slideFill.Size = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    slideFill.BackgroundColor3 = Color3.fromRGB(138, 43, 226)
+    slideFill.BorderSizePixel = 0
+    slideFill.Parent = slideTrack
+    Instance.new("UICorner", slideFill).CornerRadius = UDim.new(1,0)
+
+    local isSliding = false
+    local function updateSlider(input)
+        local absPos = slideTrack.AbsolutePosition.X
+        local absSize = slideTrack.AbsoluteSize.X
+        local percentage = math.clamp((input.Position.X - absPos) / absSize, 0, 1)
+        slideFill.Size = UDim2.new(percentage, 0, 1, 0)
+        local calculatedVal = math.round(min + (percentage * (max - min)))
+        valueLabel.Text = tostring(calculatedVal)
+        callback(calculatedVal)
+    end
+
+    slideTrack.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then isSliding = true updateSlider(input) end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if isSliding and input.UserInputType == Enum.UserInputType.MouseMovement then updateSlider(input) end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then isSliding = false end
+    end)
+end
+
+local function createInputBox(parent, labelText, yPos, defaultText, callback)
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 32)
+    container.Position = UDim2.new(0, 0, 0, yPos)
+    container.BackgroundTransparency = 1
+    container.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 180, 1, 0)
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.BackgroundTransparency = 1
+    label.Parent = container
+
+    local tBox = Instance.new("TextBox")
+    tBox.Size = UDim2.new(0, 70, 0, 26)
+    tBox.Position = UDim2.new(1, -70, 0.5, -13)
+    tBox.BackgroundColor3 = Color3.fromRGB(15, 17, 23)
+    tBox.Text = defaultText
+    tBox.TextColor3 = Color3.fromRGB(0, 229, 255)
+    tBox.Font = Enum.Font.GothamBold
+    tBox.TextSize = 11
+    tBox.Parent = container
+    Instance.new("UICorner", tBox).CornerRadius = UDim.new(0, 6)
+    local bStroke = Instance.new("UIStroke", tBox) bStroke.Color = Color3.fromRGB(45, 50, 60)
+
+    tBox.FocusLost:Connect(function()
+        callback(tBox.Text)
+    end)
+end
+
+createToggle(controlsCard, "Toggle Automation Engine Loop", 28, function(state)
+    if state then startLoop() else stopLoop() end
+end)
+
+createSlider(controlsCard, "Noclip Linear Tween Velocity", 68, 20, 150, 50, function(val)
+    TWEEN_SPEED = val
+end)
+
+createInputBox(controlsCard, "Cycles Before Auto-Selling", 112, tostring(CYCLES_BEFORE_SELL), function(text)
+    local val = tonumber(text)
+    if val and val > 0 then CYCLES_BEFORE_SELL = val end
+end)
+
+createInputBox(controlsCard, "Toggle Menu Interface Bind", 152, UI_KEYBIND.Name, function(text)
+    local success, key = pcall(function() return Enum.KeyCode[text] end)
+    if success and key then UI_KEYBIND = key end
+end)
+
+-- Card 3: Diagnostic Telemetry Panel
+local telemetryCard = createCard("Telemetry System Metrics", 125)
+
+local function buildMetric(text, y)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 20)
+    lbl.Position = UDim2.new(0, 0, 0, y)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(180, 185, 195)
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = telemetryCard
+    return lbl
+end
+
+runStatusLabel = buildMetric("Engine Matrix: ⏳ Standing By", 26)
+liveLocationLabel = buildMetric("Target Vector: 📍 Mapping Inactive", 48)
+liveFillLabel = buildMetric("Cargo Matrix Load: 📦 Load: N/A", 70)
+liveCyclesLabel = buildMetric("Batch Sequence loops: 📊 Cycles: 0/0", 92)
+
+-- Global keybind toggle handler
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == UI_KEYBIND then
+        mainWindow.Visible = not mainWindow.Visible
+    end
+end)
+
+-- Background Telemetry Refresh Daemon Thread
 task.spawn(function()
     while true do
-        updateFillLabel()
+        refreshAnalyticsDisplay()
         task.wait(0.5)
     end
 end)
-
-task.wait(0.5)
-currentTool = findPanTool()
-if currentTool then
-    toolLabel.Text = "🔧 Tool: " .. currentTool.Name
-else
-    toolLabel.Text = "🔧 Tool: None"
-end
-
-print("Prospector loaded! Set Sand and Water positions, then click Start.")
